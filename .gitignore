@@ -1,0 +1,23 @@
+# Python
+.venv
+__pycache__
+.pyc
+
+# DB  runtime
+.db
+.sqlite
+.log
+
+# Env (no subir secretos)
+.env
+.env
+
+# Node
+node_modules
+dist
+
+# IDEOS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
