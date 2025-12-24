@@ -12,61 +12,61 @@ environment variables.
 
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+import logging
+from typing import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeMeta, declarative_base
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
-from .settings import settings
+from .config import settings
 
-# Base model for all SQLAlchemy models
-Base: DeclarativeMeta = declarative_base()
+logger = logging.getLogger(__name__)
 
-# Create an async engine using SQLite. We explicitly disable the check_same_thread
-# option because async drivers manage concurrency on their own. The echo flag
-# can be toggled via environment variable if verbose SQL logging is needed.
-engine = create_async_engine(
-    settings.database_url,
-    future=True,
-    echo=settings.database_echo,
-)
+def _make_engine():
+    url = settings.database_url
 
-# Async sessionmaker bound to our engine. We enable expire_on_commit=False so
-# objects remain usable after the transaction ends, which is helpful in
-# FastAPI/async contexts.
-async_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    # ✅ SQLite async: NullPool evita resets/rollbacks raros en shutdown
+    if url.startswith("sqlite+aiosqlite"):
+        return create_async_engine(
+            url,
+            echo=False,
+            future=True,
+            poolclass=NullPool,
+        )
+
+    # Otros motores (Postgres/MySQL) pueden usar pool normal
+    return create_async_engine(
+        url,
+        echo=False,
+        future=True,
+    )
+
+engine = _make_engine()
+
+AsyncSessionLocal = sessionmaker(
     bind=engine,
+    class_=AsyncSession,
     expire_on_commit=False,
 )
 
-
-@asynccontextmanager
-async def session_scope() -> AsyncIterator[AsyncSession]:
-    """Provide an async transactional scope around a series of operations.
-
-    This helper is intended for use in background tasks (such as scheduled
-    jobs) where dependency injection via FastAPI's request cycle is not
-    available. It yields an `AsyncSession` and commits on success, rolling
-    back on failure. Sessions are automatically closed.
-    """
-    async with async_session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-
+Base = declarative_base()
 
 async def init_db() -> None:
-    """Create database tables if they do not exist.
-
-    When running under SQLite the DDL is executed on startup to ensure all
-    tables are created. For production deployments with a more robust
-    database the migration strategy should be handled by Alembic.
-    """
     async with engine.begin() as conn:
-        # Create all tables defined on the metadata
         await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables created")
+
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Dependency: 1 sesión por request, con rollback automático si hay excepción.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        except Exception:
+            # ✅ importante en async + sqlite
+            await session.rollback()
+            raise
+        finally:
+            await session.close()

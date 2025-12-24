@@ -9,7 +9,7 @@ export default function SettingsPage() {
   useEffect(() => {
     async function loadConfig() {
       try {
-        const res = await fetch("/config");
+        const res = await fetch("/config/");
         if (!res.ok) throw new Error("Failed to load");
         setConfig(await res.json());
       } catch (e) {

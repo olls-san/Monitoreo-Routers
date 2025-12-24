@@ -101,12 +101,12 @@ export function getActionRuns(params = {}) {
 // --- Automation Rules (no implementado aún en backend/app) ---
 // ✅ Evita que la UI rompa: devuelve [] si no existe el endpoint.
 export function getAutomationRules() {
-  return safeFetchJSON("/automation-rules", {}, []);
+  return safeFetchJSON("/automation-rules/", {}, []);
 }
 
 export function createAutomationRule(data) {
   return safeFetchJSON(
-    "/automation-rules",
+    "/automation-rules/",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
