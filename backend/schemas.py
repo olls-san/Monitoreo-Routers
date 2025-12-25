@@ -18,13 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import ActionStatus
 
 
+# =========================
+# HOSTS
+# =========================
+
 class HostBase(BaseModel):
     name: str
     ip: str
-    # The service no longer persists or requires a custom port for a host.
-    # Hosts are identified by their IP address and type.  The default
-    # MikroTik REST API port is handled internally by the driver, so
-    # callers should not specify it here.
     type: str
     username: str
 
@@ -36,13 +36,14 @@ class HostCreate(HostBase):
 class HostUpdate(BaseModel):
     name: Optional[str] = None
     ip: Optional[str] = None
-    # Port field removed; ignored if supplied.
     type: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
 
 
 class HostResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     ip: str
@@ -52,10 +53,14 @@ class HostResponse(BaseModel):
     last_latency_ms: Optional[float] = None
     last_check_at: Optional[datetime] = None
 
-    model_config = ConfigDict(from_attributes=True)
 
+# =========================
+# ACTION RUNS
+# =========================
 
 class ActionRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     host_id: int
     action_key: str
@@ -65,8 +70,10 @@ class ActionRunResponse(BaseModel):
     error_message: Optional[str] = None
     executed_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
 
+# =========================
+# AUTOMATIONS
+# =========================
 
 class AutomationRuleBase(BaseModel):
     host_id: int
@@ -95,12 +102,18 @@ class AutomationRuleUpdate(BaseModel):
 
 
 class AutomationRuleResponse(AutomationRuleBase):
-    id: int
-
     model_config = ConfigDict(from_attributes=True)
 
+    id: int
+
+
+# =========================
+# HEALTH
+# =========================
 
 class HealthResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     host_id: int
     online: bool
     latency_ms: Optional[float]
