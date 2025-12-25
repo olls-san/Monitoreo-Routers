@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { getHosts, getHostActions, executeHostAction } from "../api.js";
 import { useHost } from "../contexts/HostContext.jsx";
 import HostPicker from "../components/HostPicker.jsx";
-import HostLogsPanel from "../components/HostLogsPanel.jsx";
+// En Chequeos mantenemos UI rápida; el log detallado queda en Comandos/Historial.
 
 function normalizeActionsToList(raw) {
   if (!raw) return [];
@@ -157,7 +157,9 @@ export default function CheckupsPage() {
         </div>
       )}
 
-      <HostLogsPanel title="Logs relacionados a chequeos" logs={null} />
+      <div className="text-sm text-gray-500">
+        Para ver logs detallados y la salida completa de acciones, usa <span className="text-gray-300">Comandos</span> o <span className="text-gray-300">Historial</span>.
+      </div>
     </div>
   );
 }

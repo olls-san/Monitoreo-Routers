@@ -46,6 +46,11 @@ class HostResponse(HostBase):
     last_latency_ms: Optional[float] = None
     notify_enabled: bool = True
 
+    # Last action summary (derived from action history)
+    last_action_key: Optional[str] = None
+    last_action_at: Optional[datetime] = None
+    last_action_status: Optional[str] = None
+
     class Config:
         orm_mode = True
 

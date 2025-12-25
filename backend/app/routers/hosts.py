@@ -19,10 +19,47 @@ router = APIRouter(prefix="/hosts", tags=["hosts"])
 
 
 @router.get("/", response_model=List[HostResponse])
-async def list_hosts(session: AsyncSession = Depends(get_async_session)) -> List[Host]:
-    result = await session.execute(select(Host))
-    hosts = result.scalars().all()
-    return hosts
+async def list_hosts(session: AsyncSession = Depends(get_async_session)) -> List[dict]:
+    """List hosts including a lightweight 'last action' summary.
+
+    The UI needs to show "último check" (health) and "última acción" directly
+    on the router cards. Health is already cached on the Host table.
+    For last action we derive it from ActionRun without requiring one request per host.
+    """
+
+    # Subquery: last started_at per host
+    last_run_sq = (
+        select(ActionRun.host_id, func.max(ActionRun.started_at).label("max_started_at"))
+        .group_by(ActionRun.host_id)
+        .subquery()
+    )
+
+    q = (
+        select(
+            Host,
+            ActionRun.action_key,
+            ActionRun.started_at,
+            ActionRun.status,
+        )
+        .outerjoin(last_run_sq, Host.id == last_run_sq.c.host_id)
+        .outerjoin(
+            ActionRun,
+            (ActionRun.host_id == Host.id) & (ActionRun.started_at == last_run_sq.c.max_started_at),
+        )
+        .order_by(Host.id.asc())
+    )
+
+    result = await session.execute(q)
+    rows = result.all()
+
+    payload: list[dict] = []
+    for host, last_action_key, last_action_at, last_action_status in rows:
+        d = HostResponse.model_validate(host).model_dump()
+        d["last_action_key"] = last_action_key
+        d["last_action_at"] = last_action_at
+        d["last_action_status"] = last_action_status
+        payload.append(d)
+    return payload
 
 # -----------------------------------------------------------------------------
 # Trailing slash aliases

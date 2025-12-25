@@ -6,3 +6,4 @@ pydantic
 httpx
 apscheduler
 python-dotenv
+pydantic-settings

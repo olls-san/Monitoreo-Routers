@@ -13,6 +13,7 @@ export default function RoutersPage() {
   const [healthMap, setHealthMap] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [query, setQuery] = useState("");
 
   const loadData = async () => {
     setLoading(true);
@@ -55,6 +56,15 @@ export default function RoutersPage() {
     };
   }, []);
 
+  const filteredHosts = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return hosts;
+    return hosts.filter((h) => {
+      const hay = `${h.name} ${h.ip} ${h.router_type || ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [hosts, query]);
+
   return (
     <div className="space-y-4">
       <div>
@@ -64,15 +74,30 @@ export default function RoutersPage() {
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-4">
-        <HostPicker hosts={hosts} />
-        {/* CRUD NO aquí: se mueve a Settings (solo UI). */}
-        <button
-          onClick={() => navigate("/settings")}
-          className="px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm"
-        >
-          Gestionar routers
-        </button>
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-center gap-3 flex-1">
+          <HostPicker hosts={hosts} />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Buscar router (nombre / IP / tipo)"
+            className="w-full md:max-w-[420px] px-3 py-2 rounded-lg bg-gray-900 border border-gray-800 text-sm text-gray-200 placeholder:text-gray-500"
+          />
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => navigate("/settings?tab=hosts")}
+            className="px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm"
+          >
+            Gestionar routers
+          </button>
+          <button
+            onClick={() => navigate("/settings?tab=automation")}
+            className="px-3 py-2 rounded-lg bg-gray-950 border border-gray-800 hover:border-gray-700 text-sm"
+          >
+            Automatizaciones
+          </button>
+        </div>
       </div>
 
       {error && <div className="text-red-400">{error}</div>}
@@ -84,7 +109,7 @@ export default function RoutersPage() {
           className="grid gap-4"
           style={{ gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))" }}
         >
-          {hosts.map((host) => {
+          {filteredHosts.map((host) => {
             const health = healthMap[host.id] || {};
             return (
               <HostCard
@@ -104,6 +129,10 @@ export default function RoutersPage() {
                 onGoHistory={() => {
                   setSelectedHostId(String(host.id));
                   navigate("/history");
+                }}
+                onGoAutomations={() => {
+                  setSelectedHostId(String(host.id));
+                  navigate(`/settings?tab=automation&hostId=${encodeURIComponent(String(host.id))}`);
                 }}
               />
             );

@@ -38,6 +38,8 @@ async def list_runs(
         query = query.where(ActionRun.action_key == action_key)
     if status is not None:
         query = query.where(ActionRun.status == status)
+    # Most recent first
+    query = query.order_by(ActionRun.started_at.desc())
     result = await session.execute(query)
     runs = result.scalars().all()
     return runs

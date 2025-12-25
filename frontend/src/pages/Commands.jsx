@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { getHosts, getHostActions, executeHostAction } from "../api.js";
+import { getHosts, getHostActions, executeHostAction, getActionRuns } from "../api.js";
 import { useHost } from "../contexts/HostContext.jsx";
 import HostPicker from "../components/HostPicker.jsx";
-import HostLogsPanel from "../components/HostLogsPanel.jsx";
+// Logs / runs are rendered directly in this page (more useful than placeholder logs)
 
 export default function CommandsPage() {
   const { selectedHostId } = useHost();
@@ -11,6 +11,8 @@ export default function CommandsPage() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [loadingActions, setLoadingActions] = useState(false);
+  const [recentRuns, setRecentRuns] = useState([]);
+  const [selectedRunId, setSelectedRunId] = useState(null);
 
   useEffect(() => {
     async function loadHosts() {
@@ -48,6 +50,27 @@ export default function CommandsPage() {
 
     loadActions();
   }, [selectedHostId]);
+
+  useEffect(() => {
+    (async () => {
+      if (!selectedHostId) {
+        setRecentRuns([]);
+        setSelectedRunId(null);
+        return;
+      }
+      try {
+        const data = await getActionRuns({ host_id: selectedHostId });
+        const arr = Array.isArray(data) ? data : [];
+        arr.sort((a, b) => new Date(b.started_at || b.executed_at || 0).getTime() - new Date(a.started_at || a.executed_at || 0).getTime());
+        setRecentRuns(arr.slice(0, 30));
+        setSelectedRunId((prev) => prev ?? (arr[0]?.id ?? null));
+      } catch (e) {
+        console.error(e);
+      }
+    })();
+  }, [selectedHostId, result]);
+
+  const selectedRun = useMemo(() => recentRuns.find((r) => r.id === selectedRunId) || null, [recentRuns, selectedRunId]);
 
   const actionsList = useMemo(() => {
     if (!actionsRaw) return [];
@@ -129,8 +152,40 @@ export default function CommandsPage() {
         </div>
 
         {/* derecha */}
-        <div className="flex-[1]">
-          <HostLogsPanel title="Logs relacionados a comandos" logs={null} />
+        <div className="flex-[1] space-y-3">
+          <div className="rounded-2xl border border-gray-800 bg-gray-900 overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-800 font-semibold">Actividad reciente</div>
+            <div className="max-h-[360px] overflow-auto">
+              {recentRuns.length === 0 ? (
+                <div className="p-4 text-sm text-gray-400">—</div>
+              ) : (
+                <ul className="divide-y divide-gray-800">
+                  {recentRuns.map((r) => (
+                    <li
+                      key={r.id}
+                      onClick={() => setSelectedRunId(r.id)}
+                      className={`p-3 cursor-pointer hover:bg-gray-950 ${r.id === selectedRunId ? "bg-blue-900/20" : ""}`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <div className="font-mono text-xs text-gray-200 truncate">{r.action_key}</div>
+                        <div className="ml-auto text-xs text-gray-500">
+                          {r.executed_at ? new Date(r.executed_at).toLocaleString() : "—"}
+                        </div>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">{r.status}</div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-gray-800 bg-gray-950 p-4">
+            <div className="font-semibold mb-2">Log / detalle</div>
+            <pre className="text-xs font-mono whitespace-pre-wrap text-gray-200">
+              {selectedRun ? (selectedRun.stdout || selectedRun.stderr || JSON.stringify(selectedRun.response_parsed || selectedRun, null, 2)) : "Seleccione una ejecución"}
+            </pre>
+          </div>
         </div>
       </div>
     </div>

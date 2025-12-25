@@ -48,6 +48,16 @@ export default function HistoryPage() {
     [runs, selectedRunId]
   );
 
+  const orderedRuns = useMemo(() => {
+    const arr = Array.isArray(runs) ? [...runs] : [];
+    arr.sort((a, b) => {
+      const ta = new Date(a.started_at || a.executed_at || 0).getTime();
+      const tb = new Date(b.started_at || b.executed_at || 0).getTime();
+      return tb - ta; // latest first
+    });
+    return arr;
+  }, [runs]);
+
   const hostName = useMemo(() => {
     const h = hosts.find((x) => String(x.id) === String(selectedHostId));
     return h ? h.name : (selectedHostId ? String(selectedHostId) : "—");
@@ -83,7 +93,7 @@ export default function HistoryPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800">
-                {runs.map((r) => {
+                {orderedRuns.map((r) => {
                   const active = r.id === selectedRunId;
                   return (
                     <tr
@@ -144,9 +154,47 @@ export default function HistoryPage() {
             <div className="font-semibold mb-2">Detalle</div>
 
             {/* Si no hay stdout/stderr en la API, mostramos JSON como placeholder */}
-            <pre className="text-sm font-mono whitespace-pre-wrap">
-              {selectedRun ? JSON.stringify(selectedRun, null, 2) : "Seleccione una ejecución"}
-            </pre>
+            {selectedRun ? (
+              <div className="space-y-3 text-sm">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-gray-800 bg-gray-900 p-3">
+                    <div className="text-xs text-gray-500">Inicio</div>
+                    <div className="text-gray-200 mt-1">
+                      {selectedRun.started_at || selectedRun.executed_at ? new Date(selectedRun.started_at || selectedRun.executed_at).toLocaleString() : "—"}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-gray-800 bg-gray-900 p-3">
+                    <div className="text-xs text-gray-500">Duración</div>
+                    <div className="text-gray-200 mt-1">
+                      {typeof selectedRun.duration_ms === "number" ? `${Math.round(selectedRun.duration_ms)} ms` : "—"}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-gray-800 bg-gray-900 p-3">
+                  <div className="text-xs text-gray-500">Respuesta parseada</div>
+                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap text-gray-200">
+                    {selectedRun.response_parsed ? JSON.stringify(selectedRun.response_parsed, null, 2) : "—"}
+                  </pre>
+                </div>
+
+                <div className="rounded-xl border border-gray-800 bg-gray-900 p-3">
+                  <div className="text-xs text-gray-500">STDOUT</div>
+                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap text-gray-200">
+                    {selectedRun.stdout ? (typeof selectedRun.stdout === "string" ? selectedRun.stdout : JSON.stringify(selectedRun.stdout, null, 2)) : "—"}
+                  </pre>
+                </div>
+
+                <div className="rounded-xl border border-gray-800 bg-gray-900 p-3">
+                  <div className="text-xs text-gray-500">STDERR</div>
+                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap text-gray-200">
+                    {selectedRun.stderr ? (typeof selectedRun.stderr === "string" ? selectedRun.stderr : JSON.stringify(selectedRun.stderr, null, 2)) : "—"}
+                  </pre>
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-gray-400">Seleccione una ejecución</div>
+            )}
           </div>
         </div>
       </div>
