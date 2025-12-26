@@ -22,11 +22,37 @@ _DRIVER_REGISTRY: Dict[str, Type[RouterDriver]] = {
 }
 
 
-def get_driver(router_type: str) -> RouterDriver:
-    """Return a driver instance for the given router type.
+def get_driver(router_type: str):
+    if not router_type:
+        raise KeyError("router_type is empty")
 
-    Raises:
-        KeyError: if no driver is registered for the type.
-    """
-    cls = _DRIVER_REGISTRY[router_type]
+    raw = str(router_type).strip()
+
+    # 1) normalización básica
+    key = raw.upper()
+
+    # 2) aliases soportados (valores “humanos” o legacy en DB)
+    aliases = {
+        "MIKROTIK": "MIKROTIK_ROUTEROS_REST",
+        "MIKROTIK_REST": "MIKROTIK_ROUTEROS_REST",
+        "MIKROTIK_ROUTEROS": "MIKROTIK_ROUTEROS_REST",
+        "MIKROTIK_ROUTEROS_REST": "MIKROTIK_ROUTEROS_REST",
+
+        # caso exacto del error del log:
+        "MIKROTIK".lower(): "MIKROTIK_ROUTEROS_REST",  # "mikrotik"
+    }
+
+    # si vino "mikrotik" (lower) u otro alias, mapear
+    if raw in aliases:
+        key = aliases[raw]
+    elif key in aliases:
+        key = aliases[key]
+
+    # 3) lookup final
+    try:
+        cls = _DRIVER_REGISTRY[key]
+    except KeyError:
+        available = ", ".join(sorted(_DRIVER_REGISTRY.keys()))
+        raise KeyError(f"Unknown router_type '{router_type}'. Normalized '{key}'. Available: {available}")
+
     return cls()
