@@ -1,13 +1,3 @@
-"""Pydantic models for MoniTe Web API schemas.
-
-These classes define the request and response payloads exposed by the FastAPI
-backend. All schemas derive from Pydantic's `BaseModel` and are configured
-using `ConfigDict` to allow construction from ORM objects via
-`from_attributes=True`. The models are purposefully separated into input
-schemas (for creating/updating resources) and output schemas (for responses).
-Sensitive fields such as passwords are excluded from response models.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -18,22 +8,29 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import ActionStatus
 
 
+# ======================================================
+# BASE CONFIG (OBLIGATORIA PARA Pydantic v2 + ORM)
+# ======================================================
+
+class ORMBaseModel(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+    )
+
+
 # =========================
 # HOSTS
 # =========================
 
-class HostBase(BaseModel):
-    # permite usar alias en input/output
-    model_config = ConfigDict(populate_by_name=True)
-
+class HostBase(ORMBaseModel):
     name: str
     ip: str
     username: str = "admin"
 
-    # El frontend usa "type", el modelo usa "router_type"
+    # UI usa "type", DB usa "router_type"
     router_type: str = Field(default="MIKROTIK_ROUTEROS_REST", alias="type")
 
-    # Campos que existen en el modelo Host
     enabled: bool = True
     notify_enabled: bool = True
 
@@ -43,9 +40,7 @@ class HostCreate(HostBase):
     port: int = 80
 
 
-class HostUpdate(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
+class HostUpdate(ORMBaseModel):
     name: Optional[str] = None
     ip: Optional[str] = None
     username: Optional[str] = None
@@ -57,27 +52,24 @@ class HostUpdate(BaseModel):
     notify_enabled: Optional[bool] = None
 
 
-class HostResponse(BaseModel):
-    # clave: permite leer atributos de SQLAlchemy
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
+class HostResponse(ORMBaseModel):
     id: int
     name: str
     ip: str
     username: str
 
-    # Exponer "type" hacia UI, leyendo Host.router_type en DB
+    # Exponer "type" hacia UI
     type: str = Field(alias="router_type")
 
     enabled: bool = True
     notify_enabled: bool = True
 
-    # Cache fields del Host (en DB existen como last_status/last_checked_at/last_latency_ms)
+    # Cache health
     last_online: Optional[bool] = None
     last_latency_ms: Optional[float] = None
     last_check_at: Optional[datetime] = None
 
-    # Derivados (para tarjetas)
+    # Última acción
     last_action_key: Optional[str] = None
     last_action_at: Optional[datetime] = None
     last_action_status: Optional[str] = None
@@ -87,9 +79,7 @@ class HostResponse(BaseModel):
 # ACTION RUNS
 # =========================
 
-class ActionRunResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class ActionRunResponse(ORMBaseModel):
     id: int
     host_id: int
     action_key: str
@@ -104,7 +94,7 @@ class ActionRunResponse(BaseModel):
 # AUTOMATIONS
 # =========================
 
-class AutomationRuleBase(BaseModel):
+class AutomationRuleBase(ORMBaseModel):
     host_id: int
     action_key: str
     cron: str
@@ -119,7 +109,7 @@ class AutomationRuleCreate(AutomationRuleBase):
     pass
 
 
-class AutomationRuleUpdate(BaseModel):
+class AutomationRuleUpdate(ORMBaseModel):
     host_id: Optional[int] = None
     action_key: Optional[str] = None
     cron: Optional[str] = None
@@ -131,8 +121,6 @@ class AutomationRuleUpdate(BaseModel):
 
 
 class AutomationRuleResponse(AutomationRuleBase):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
 
 
@@ -140,9 +128,7 @@ class AutomationRuleResponse(AutomationRuleBase):
 # HEALTH
 # =========================
 
-class HealthResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class HealthResponse(ORMBaseModel):
     host_id: int
     online: bool
     latency_ms: Optional[float]
