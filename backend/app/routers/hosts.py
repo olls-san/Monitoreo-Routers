@@ -55,6 +55,13 @@ async def list_hosts(session: AsyncSession = Depends(get_async_session)) -> List
     payload: list[dict] = []
     for host, last_action_key, last_action_at, last_action_status in rows:
         d = HostResponse.model_validate(host).model_dump()
+
+        # mapear cache de health del Host
+        d["last_latency_ms"] = host.last_latency_ms
+        d["last_check_at"] = host.last_checked_at
+        d["last_online"] = (host.last_status == "ONLINE") if host.last_status else None
+
+        # last action derivado
         d["last_action_key"] = last_action_key
         d["last_action_at"] = last_action_at
         d["last_action_status"] = last_action_status
@@ -72,6 +79,7 @@ async def list_hosts(session: AsyncSession = Depends(get_async_session)) -> List
 
 @router.get("", response_model=List[HostResponse])
 async def list_hosts_alias(session: AsyncSession = Depends(get_async_session)) -> List[Host]:
+
     """Alias for ``/hosts/`` to avoid 307 redirects on ``/hosts``."""
     return await list_hosts(session)
 

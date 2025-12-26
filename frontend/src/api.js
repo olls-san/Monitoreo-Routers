@@ -1,6 +1,25 @@
 // API helper functions to interact with the backend
 
-export async function fetchJSON(url, options = {}) {
+// Base URL del backend:
+// - En prod: define VITE_API_BASE en .env.production (ej: http://192.168.188.165:8000)
+// - En dev: también puedes usar .env (VITE_API_BASE=...)
+// - Fallback: intenta mismo host pero puerto 8000
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  `${window.location.protocol}//${window.location.hostname}:8000`;
+
+function toAPIUrl(pathOrUrl) {
+  // Si ya viene full URL (http/https), no tocar
+  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+
+  // Asegurar que path empieza con /
+  const path = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+  return `${API_BASE}${path}`;
+}
+
+export async function fetchJSON(pathOrUrl, options = {}) {
+  const url = toAPIUrl(pathOrUrl);
+
   const res = await fetch(url, options);
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
@@ -10,6 +29,7 @@ export async function fetchJSON(url, options = {}) {
     e.url = url;
     throw e;
   }
+
   // Algunos endpoints pueden devolver 204 No Content
   if (res.status === 204) return null;
   return res.json();
@@ -22,11 +42,11 @@ function normalizeCollectionPath(path) {
   return path + "/";
 }
 
-async function safeFetchJSON(url, options = {}, fallbackValue) {
+async function safeFetchJSON(pathOrUrl, options = {}, fallbackValue) {
   try {
-    return await fetchJSON(url, options);
+    return await fetchJSON(pathOrUrl, options);
   } catch (e) {
-    // Si el backend/app aún no implementa el endpoint (404), no romper UI
+    // Si el backend aún no implementa el endpoint (404), no romper UI
     if (e && (e.status === 404 || String(e.message).includes("Not Found"))) {
       return fallbackValue;
     }
@@ -56,7 +76,8 @@ export function updateHost(id, data) {
 }
 
 export async function deleteHost(id) {
-  const res = await fetch(`/hosts/${id}`, { method: "DELETE" });
+  const url = toAPIUrl(`/hosts/${id}`);
+  const res = await fetch(url, { method: "DELETE" });
   if (!res.ok && res.status !== 204) {
     const errText = await res.text().catch(() => "");
     throw new Error(errText || res.statusText);
@@ -91,14 +112,14 @@ export function getHostHealth(id) {
   return fetchJSON(`/hosts/${id}/health`);
 }
 
-// --- History (no implementado aún en backend/app) ---
+// --- History ---
 // ✅ Evita que la UI rompa: devuelve [] si no existe el endpoint.
 export function getActionRuns(params = {}) {
   const query = new URLSearchParams(params).toString();
-  return safeFetchJSON(`/action-runs${query ? "?" + query : ""}`, {}, []);
+  return safeFetchJSON(`/action-runs/${query ? "?" + query : ""}`, {}, []);
 }
 
-// --- Automation Rules (no implementado aún en backend/app) ---
+// --- Automation Rules ---
 // ✅ Evita que la UI rompa: devuelve [] si no existe el endpoint.
 export function getAutomationRules() {
   return safeFetchJSON("/automation-rules/", {}, []);
@@ -129,7 +150,8 @@ export function updateAutomationRule(id, data) {
 }
 
 export async function deleteAutomationRule(id) {
-  const res = await fetch(`/automation-rules/${id}`, { method: "DELETE" });
+  const url = toAPIUrl(`/automation-rules/${id}`);
+  const res = await fetch(url, { method: "DELETE" });
   if (!res.ok && res.status !== 204) {
     const errText = await res.text().catch(() => "");
     // Si no existe endpoint todavía, no rompas UI
