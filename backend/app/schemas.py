@@ -5,59 +5,92 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import ActionStatus, RouterType
 
 
+# ======================================================
+# Base: Pydantic v2 + ORM + alias support
+# ======================================================
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+    )
+
+
 # ------------------------------- Host Schemas -------------------------------
 
-class HostBase(BaseModel):
+class HostBase(ORMModel):
     name: str = Field(..., description="Friendly name of the router")
     ip: str = Field(..., description="IP address of the router")
     username: str = Field("admin", description="Username for authentication")
     password: Optional[str] = Field(None, description="Password for authentication")
     port: int = Field(80, description="HTTP port of the REST API")
-    router_type: str = Field(RouterType.MIKROTIK_ROUTEROS_REST.value, description="Router type key")
+
+    # DB/model usa router_type, UI suele enviar/leer "type"
+    router_type: str = Field(
+        default=RouterType.MIKROTIK_ROUTEROS_REST.value,
+        alias="type",
+        description="Router type key",
+    )
+
     enabled: bool = Field(True, description="Whether the router is active")
+    notify_enabled: bool = Field(True, description="Whether telegram notifications are enabled")
 
 
 class HostCreate(HostBase):
     pass
 
 
-class HostUpdate(BaseModel):
+class HostUpdate(ORMModel):
     name: Optional[str] = None
     ip: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     port: Optional[int] = None
-    router_type: Optional[str] = None
+
+    router_type: Optional[str] = Field(default=None, alias="type")
     enabled: Optional[bool] = None
     notify_enabled: Optional[bool] = None
 
 
-class HostResponse(HostBase):
+class HostResponse(ORMModel):
     id: int
 
-    # Cache fields for quick status display
+    # Campos base (mismos de HostBase, pero no heredamos para evitar
+    # que password sea "requerido" en response según algunas validaciones)
+    name: str
+    ip: str
+    username: str
+    port: int
+    enabled: bool
+    notify_enabled: bool
+
+    # Exponer "type" a la UI (alias de router_type en DB)
+    type: str = Field(alias="router_type")
+
+    # Cache fields en DB (los nombres reales del modelo)
     last_status: Optional[str] = None
     last_checked_at: Optional[datetime] = None
     last_latency_ms: Optional[float] = None
-    notify_enabled: bool = True
+
+    # Campos que la UI usa (compatibilidad)
+    last_online: Optional[bool] = None
+    last_check_at: Optional[datetime] = None
+    last_latency_ms_ui: Optional[float] = Field(default=None, alias="last_latency_ms")
 
     # Last action summary (derived from action history)
     last_action_key: Optional[str] = None
     last_action_at: Optional[datetime] = None
     last_action_status: Optional[str] = None
 
-    class Config:
-        orm_mode = True
-
 
 # -------------------------- Automation Rule Schemas -------------------------
 
-class AutomationRuleBase(BaseModel):
+class AutomationRuleBase(ORMModel):
     host_id: int
     action_key: str
     schedule: str = Field(..., description="Cron expression (e.g. '*/10 * * * *')")
@@ -73,7 +106,7 @@ class AutomationRuleCreate(AutomationRuleBase):
     pass
 
 
-class AutomationRuleUpdate(BaseModel):
+class AutomationRuleUpdate(ORMModel):
     host_id: Optional[int] = None
     action_key: Optional[str] = None
     schedule: Optional[str] = None
@@ -88,46 +121,31 @@ class AutomationRuleUpdate(BaseModel):
 class AutomationRuleResponse(AutomationRuleBase):
     id: int
 
-    class Config:
-        orm_mode = True
-
 
 # ---------------------------- Action Run Schemas ----------------------------
 
-class ActionRunResponse(BaseModel):
-    """Response schema for action run records.
-
-    Includes timing information (start/finish/duration) and stdout/stderr
-    streams in addition to the previous fields. The ``executed_at`` field
-    is retained for backwards compatibility and mirrors ``started_at``.
-    """
+class ActionRunResponse(ORMModel):
+    """Response schema for action run records."""
 
     id: int
     host_id: int
     router_type: str
     action_key: str
-    # Start time of the action (previously ``executed_at``)
+
     started_at: datetime
-    # Alias for backwards compatibility; maps to ``started_at``
-    executed_at: datetime
-    # Finish time of the action
+    executed_at: datetime  # alias compatible (mismo valor en router)
     finished_at: Optional[datetime] = None
-    # Total duration in milliseconds
     duration_ms: Optional[float] = None
+
     status: ActionStatus
-    # Captured standard output and error streams
     stdout: Optional[Any] = None
     stderr: Optional[Any] = None
-    # Parsed structured data and raw response from the driver
     response_parsed: Optional[Any] = None
     response_raw: Optional[Any] = None
     error_message: Optional[str] = None
 
-    class Config:
-        orm_mode = True
 
-
-class HostHealthResponse(BaseModel):
+class HostHealthResponse(ORMModel):
     """Response schema for host health history entries."""
 
     id: int
@@ -137,21 +155,12 @@ class HostHealthResponse(BaseModel):
     error_message: Optional[str] = None
     checked_at: datetime
 
-    class Config:
-        orm_mode = True
-
 
 # ---------------------------- Execute Action Schema ----------------------------
 
 class ExecuteActionRequest(BaseModel):
-    """Request body for executing an arbitrary action on a host.
-
-    The frontend sends an ``action_key`` identifying which action to run
-    and an optional ``params`` dictionary containing any parameters
-    required by the driver.  Parameters are passed through to the
-    underlying driver without validation here; drivers should perform
-    their own validation.
-    """
-
     action_key: str = Field(..., description="Key identifying the action to execute")
-    params: Optional[dict[str, Any]] = Field(default_factory=dict, description="Optional parameters for the action")
+    params: Optional[dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Optional parameters for the action",
+    )
