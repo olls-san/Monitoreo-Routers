@@ -4,7 +4,6 @@ import { NavLink, useNavigate } from "react-router-dom";
 const tabs = [
   { path: "/", label: "Routers" },
   { path: "/history", label: "Historial" },
-  { path: "/checkups", label: "Chequeos" },
   { path: "/commands", label: "Comandos" },
   { path: "/settings", label: "Configuración" },
 ];
