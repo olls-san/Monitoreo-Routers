@@ -38,6 +38,8 @@ class RouterType(str, enum.Enum):
     """
 
     MIKROTIK_ROUTEROS_REST = "MIKROTIK_ROUTEROS_REST"
+    TP_LINK_OPENWRT_SSH = "TP_LINK_OPENWRT_SSH"
+
     # Future types: HUAWEI_*, ZTE_*, GENERIC_SSH etc.
 
 

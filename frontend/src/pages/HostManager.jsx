@@ -32,6 +32,7 @@ function HostForm({ initial, onSave, onCancel }) {
         <label className="block text-sm">Tipo</label>
         <select name="type" value={form.type} onChange={handleChange} className="w-full p-2 text-black">
           <option value="mikrotik">MikroTik</option>
+          <option value="tplink">TP-Link (OpenWrt)</option>
         </select>
       </div>
       <div>
