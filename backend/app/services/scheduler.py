@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,6 +21,7 @@ from ..models import AutomationRule, Host
 from ..services.action_runner import execute_and_record
 from ..services.health_monitor import check_all_hosts, send_daily_summary
 from ..services.app_settings import get_telegram_schedule
+from ..services.telegram import send_alert, format_msg
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,6 @@ class SchedulerService:
 
     async def reschedule_daily_summary(self) -> None:
         """(Re)Schedule the daily summary job based on DB settings."""
-        # Lee schedule desde DB (o defaults)
         sched = None
         async for session in get_async_session():
             sched = await get_telegram_schedule(session)
@@ -87,7 +88,6 @@ class SchedulerService:
         minute = int((sched or {}).get("minute", 0))
         tz = str((sched or {}).get("timezone", getattr(settings, "scheduler_timezone", "UTC")))
 
-        # Remover job si existe
         try:
             if self.scheduler.get_job("daily_summary"):
                 self.scheduler.remove_job("daily_summary")
@@ -180,7 +180,9 @@ class SchedulerService:
                 return
 
             attempts = rule.max_attempts if rule.retry_enabled else 1
+            start_utc = datetime.utcnow().isoformat() + "Z"
 
+            last_run = None
             for attempt in range(1, attempts + 1):
                 run = await execute_and_record(
                     session,
@@ -190,6 +192,7 @@ class SchedulerService:
                     max_attempts=attempts,
                     telegram_enabled=rule.telegram_enabled,
                 )
+                last_run = run
 
                 status_value = getattr(run.status, "value", run.status)
                 if status_value == "SUCCESS":
@@ -203,4 +206,78 @@ class SchedulerService:
                         attempt + 1, attempts,
                     )
                     await asyncio.sleep(delay)
+
+            # -------------------------
+            # Telegram (formato unificado) — resultado FINAL
+            # -------------------------
+            try:
+                if rule.telegram_enabled and last_run is not None:
+                    status_value = getattr(last_run.status, "value", last_run.status)
+                    dur_ms = getattr(last_run, "duration_ms", None)
+                    dur_txt = f"{dur_ms:.0f} ms" if isinstance(dur_ms, (int, float)) else "n/a"
+
+                    schedule = (rule.schedule or "").strip() or "n/a"
+                    action_key = rule.action_key or "n/a"
+
+                    if status_value == "SUCCESS":
+                        msg = format_msg(
+                            title="⚙️ AUTOMATIZACIÓN — Ejecutada",
+                            host_name=host.name,
+                            host_ip=host.ip,
+                            when=datetime.utcnow().isoformat() + "Z",
+                            sections=[
+                                ("🧩 Regla", [
+                                    f"• ID: {rule_id}",
+                                    f"• Cron: {schedule}",
+                                    f"• Acción: {action_key}",
+                                ]),
+                                ("✅ Resultado", [
+                                    f"• Estado: SUCCESS",
+                                    f"• Intentos: 1/{attempts}",
+                                    f"• Duración: {dur_txt}",
+                                    f"• Inicio: {start_utc}",
+                                ]),
+                            ],
+                            suggested=[
+                                "Si esperabas otro resultado, revisar la regla y el cron",
+                                "Ver el historial de acciones para detalle",
+                            ],
+                            footer="⚙️ Origen: Scheduler",
+                        )
+                        await send_alert(host.id, f"auto_{rule_id}_success", msg)
+
+                    else:
+                        err = getattr(last_run, "error_message", None) or getattr(last_run, "stderr", None) or "n/a"
+                        msg = format_msg(
+                            title="🚫 AUTOMATIZACIÓN — Falló",
+                            host_name=host.name,
+                            host_ip=host.ip,
+                            when=datetime.utcnow().isoformat() + "Z",
+                            sections=[
+                                ("🧩 Regla", [
+                                    f"• ID: {rule_id}",
+                                    f"• Cron: {schedule}",
+                                    f"• Acción: {action_key}",
+                                ]),
+                                ("❌ Resultado", [
+                                    f"• Estado: {status_value}",
+                                    f"• Intentos: {attempts}/{attempts}",
+                                    f"• Duración: {dur_txt}",
+                                    f"• Inicio: {start_utc}",
+                                ]),
+                                ("🧯 Error", [
+                                    f"• {str(err)[:400]}",
+                                ]),
+                            ],
+                            suggested=[
+                                "Revisar conectividad / VPN / energía",
+                                "Ejecutar la acción manualmente desde el panel",
+                            ],
+                            footer="⚙️ Origen: Scheduler",
+                        )
+                        await send_alert(host.id, f"auto_{rule_id}_fail", msg)
+
+            except Exception as exc:
+                logger.exception("Failed to send automation result telegram for rule %s: %s", rule_id, exc)
+
             break

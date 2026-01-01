@@ -12,10 +12,9 @@ calls to :func:`send_alert` will be silently ignored.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -28,9 +27,7 @@ logger = logging.getLogger(__name__)
 # (host_id, alert_key). Value is datetime of last send.
 _LAST_ALERT_TIMES: Dict[Tuple[int, str], datetime] = {}
 
-# Cooldown period in seconds for duplicate alerts. This value comes
-# from the application settings and can be configured via environment
-# variables. Defaults to 900 seconds (15 minutes) if not set.
+
 def _cooldown_seconds() -> int:
     try:
         return int(getattr(settings, "telegram_cooldown_seconds", 900) or 900)
@@ -38,13 +35,67 @@ def _cooldown_seconds() -> int:
         return 900
 
 
-async def _post_message(text: str) -> None:
-    """Send a message to Telegram via HTTP API.
+def _safe_str(x: object) -> str:
+    try:
+        s = str(x)
+    except Exception:
+        return "n/a"
+    return s
 
-    This helper uses httpx to issue a POST request to the
-    `/sendMessage` endpoint. It does not retry on failure; the
-    calling code should catch exceptions.
+
+def format_msg(
+    *,
+    title: str,
+    host_name: Optional[str] = None,
+    host_ip: Optional[str] = None,
+    when: Optional[str] = None,
+    sections: Optional[List[Tuple[str, List[str]]]] = None,
+    suggested: Optional[List[str]] = None,
+    footer: Optional[str] = None,
+) -> str:
     """
+    Formato unificado para Telegram (mismo estilo que resumen/chequeos).
+
+    sections: lista de tuples (titulo_seccion, lineas)
+      ejemplo: [("📊 Estado", ["• Datos: 5.2 GB", "• Vigencia: 3 días"])]
+    suggested: lista de bullets para "Acción sugerida"
+    """
+    lines: List[str] = []
+    lines.append(title)
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    if host_name or host_ip:
+        hn = host_name or "n/a"
+        hip = host_ip or "n/a"
+        lines.append(f"📍 Host: {hn}")
+        lines.append(f"🌐 IP: {hip}")
+
+    if when:
+        lines.append(f"🕒 Hora: {when}")
+
+    if sections:
+        for sec_title, sec_lines in sections:
+            if not sec_lines:
+                continue
+            lines.append("")
+            lines.append(sec_title)
+            lines.extend(sec_lines)
+
+    if suggested:
+        lines.append("")
+        lines.append("Acción sugerida:")
+        for s in suggested:
+            lines.append(f"• {s}")
+
+    if footer:
+        lines.append("")
+        lines.append(footer)
+
+    return "\n".join(lines)
+
+
+async def _post_message(text: str) -> None:
+    """Send a message to Telegram via HTTP API."""
     if not settings.telegram_token or not settings.telegram_chat_id:
         logger.info("Telegram not configured; skipping message: %s", text)
         return
@@ -58,19 +109,7 @@ async def _post_message(text: str) -> None:
 
 
 async def send_alert(host_id: int, alert_key: str, message: str) -> None:
-    """Send an alert message with anti-spam control.
-
-    Args:
-        host_id: ID of the host that triggered the alert.
-        alert_key: A stable identifier for the alert type
-            (e.g. "low_data", "expiring_data", "low_balance", "no_response").
-        message: The text to send to Telegram.
-
-    The function checks whether a message of this type has been sent
-    recently for the same host and suppresses duplicates within the
-    cooldown period. This prevents flooding chats with repeated
-    alerts when an issue persists.
-    """
+    """Send an alert message with anti-spam control."""
     now = datetime.utcnow()
     key = (host_id, alert_key)
     last_sent = _LAST_ALERT_TIMES.get(key)

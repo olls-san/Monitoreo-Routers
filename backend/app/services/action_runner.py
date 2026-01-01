@@ -10,10 +10,9 @@ from typing import Any, Dict, Optional, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
 from ..models import ActionRun, ActionStatus, Host
 from ..drivers import get_driver
-from ..services.telegram import send_alert
+from ..services.telegram import send_alert, format_msg
 from ..services.app_settings import get_telegram_severity
 from ..services.severity import evaluate_severity
 
@@ -108,7 +107,7 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
     Extrae datos_mb, validos_dias, saldo desde el texto del USSD.
 
     REGLAS IMPORTANTES:
-    - DATOS: solo se extrae desde el label "Datos:" (ignora "toDus:", "toDus", "todus", etc.)
+    - DATOS: solo se extrae desde el label "Datos:" (ignora "toDus:", "todus", etc.)
     - VALIDOS: soporta "validos 33 dias" y también "validos: 33 dias"
     - SALDO: intenta "Saldo: X" si existe
 
@@ -124,14 +123,10 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
     t = t.replace(",", ".")  # 1,5 -> 1.5
     t = t.replace("\n", " ")
 
-    # -------------------------
-    # DATOS (SOLO desde "Datos:")
-    # Puede venir "Datos: 11.05 GB" o "Datos: 900 MB"
-    # Si aparece más de una vez, tomamos la ÚLTIMA ocurrencia.
-    # -------------------------
+    # DATOS solo desde "Datos:"
     datos_matches = re.findall(r"datos\s*:\s*(\d+(?:\.\d+)?)\s*(gb|mb)\b", t)
     if datos_matches:
-        val_str, unit = datos_matches[-1]  # <-- la última ocurrencia de "Datos:"
+        val_str, unit = datos_matches[-1]  # última ocurrencia de "Datos:"
         try:
             val = float(val_str)
             datos_mb = val * 1024.0 if unit == "gb" else val
@@ -139,13 +134,7 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # -------------------------
-    # VALIDOS / VÁLIDOS
-    # Soporta:
-    # - "validos 33 dias"
-    # - "validos: 33 dias"
-    # - "validos=33 dias" (por si acaso)
-    # -------------------------
+    # VALIDOS
     m = re.search(r"\bvalidos?\b\s*[:=\s]\s*(\d+)\s*dias?\b", t)
     if m:
         try:
@@ -153,9 +142,7 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # -------------------------
     # SALDO (opcional)
-    # -------------------------
     m = re.search(r"\bsaldo\b\s*[:=\-]?\s*\$?\s*(\d+(?:\.\d+)?)\b", t)
     if m:
         try:
@@ -163,12 +150,10 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # ok_parse si logró algo útil
     if any(k in out for k in ("datos_mb", "validos_dias", "saldo")):
         out["ok_parse"] = True
 
     return out
-
 
 
 def fmt_mb(mb: Any) -> str:
@@ -212,7 +197,6 @@ async def execute_and_record(
         response_raw = result.get("raw")
 
         if action_key == "VER_LOGS_USSD":
-            # Guardamos raw en memoria solo para alertas
             ussd_raw_for_alerts = response_raw
 
             latest = extract_latest_ussd(response_raw)
@@ -255,7 +239,7 @@ async def execute_and_record(
         stdout=_to_json_text(stdout),
         stderr=_to_json_text(stderr),
         response_parsed=_to_json_text(response_parsed),
-        response_raw=None,  # ⛔ nunca guardamos logs gigantes
+        response_raw=None,
         error_message=error_message,
     )
 
@@ -264,41 +248,68 @@ async def execute_and_record(
     await session.refresh(run)
 
     # ------------------------
-    # Alerts
+    # Alerts (formato unificado)
     # ------------------------
     if telegram_enabled and status == ActionStatus.SUCCESS.value and action_key == "VER_LOGS_USSD":
-        latest = None
-        if isinstance(response_parsed, dict):
-            latest = response_parsed.get("ussd_latest")
+        parsed = response_parsed if isinstance(response_parsed, dict) else None
+        latest = parsed.get("ussd_latest") if parsed else None
 
-        # 1) Enviar SIEMPRE el último USSD (si hay)
+        # 1) USSD (último) — formateado
         if latest and latest.get("message"):
-            msg = str(latest.get("message"))
-            t = (
-                (response_parsed.get("time") if isinstance(response_parsed, dict) else None)
-                or latest.get("time")
-                or datetime.utcnow().isoformat()
-            )
+            raw_msg = str(latest.get("message"))
+            t = (parsed.get("time") if parsed else None) or latest.get("time") or datetime.utcnow().isoformat()
 
-            message = (
-                "MoniTe – USSD (último)\n"
-                f"Host: {host.name} ({host.ip})\n"
-                f"Hora: {t}\n"
-                f"{msg}"
+            datos_mb = parsed.get("datos_mb") if parsed else None
+            validos_dias = parsed.get("validos_dias") if parsed else None
+            saldo = parsed.get("saldo") if parsed else None
+            ok_parse = bool(parsed and parsed.get("ok_parse") is True)
+
+            sections = []
+            if ok_parse:
+                sections.append(
+                    ("📊 Estado", [
+                        f"• Datos: {fmt_mb(datos_mb)}",
+                        f"• Vigencia: {validos_dias if validos_dias is not None else 'n/a'} días",
+                        f"• Saldo: {saldo if saldo is not None else 'n/a'}",
+                    ])
+                )
+
+            # Siempre incluimos el texto original como “Detalle”
+            sections.append(("📝 Detalle USSD", [raw_msg]))
+
+            message = format_msg(
+                title="📟 USSD — Último",
+                host_name=host.name,
+                host_ip=host.ip,
+                when=t,
+                sections=sections,
+                suggested=[
+                    "Si el saldo o vigencia no coincide, repetir consulta",
+                    "Verificar SIM/operador si hay errores recurrentes",
+                ],
+                footer="⚙️ Origen: Comando USSD",
             )
             await send_alert(host.id, "ussd_latest", message)
 
-        # 2) Mantener alerta especial si hubo "saldo insuficiente"
+        # 2) Saldo insuficiente — formateado
         if ussd_raw_for_alerts is not None and has_saldo_insuficiente(ussd_raw_for_alerts):
-            message = (
-                "ALERTA MoniTe – Saldo insuficiente\n"
-                f"Host: {host.name} ({host.ip})\n"
-                f"Hora: {datetime.utcnow().isoformat()}Z"
+            message = format_msg(
+                title="🧨 ALERTA — Saldo insuficiente",
+                host_name=host.name,
+                host_ip=host.ip,
+                when=datetime.utcnow().isoformat() + "Z",
+                sections=[
+                    ("📌 Detalle", ["• Se detectó 'saldo insuficiente' en el USSD."])
+                ],
+                suggested=[
+                    "Recargar saldo o revisar límite del plan",
+                    "Reintentar USSD después de recarga",
+                ],
+                footer="⚙️ Origen: Comando USSD",
             )
             await send_alert(host.id, "low_balance", message)
 
-        # 3) Severidad configurable desde el front
-        parsed = response_parsed if isinstance(response_parsed, dict) else None
+        # 3) Severidad configurable desde el front — formateado
         if parsed and parsed.get("ok_parse") is True:
             datos_mb = parsed.get("datos_mb")
             validos_dias = parsed.get("validos_dias")
@@ -309,25 +320,50 @@ async def execute_and_record(
             sev = evaluate_severity(datos_mb, validos_dias, thresholds)
 
             if sev:
-                msg = (
-                    f"{sev} – Estado del servicio\n"
-                    f"Host: {host.name} ({host.ip})\n"
-                    f"Lectura: {t}\n"
-                    f"Datos: {fmt_mb(datos_mb)}\n"
-                    f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días\n"
-                    f"Saldo: {saldo if saldo is not None else 'n/a'}"
-                )
-                await send_alert(host.id, f"sev_{sev.lower()}", msg)
+                icon = {"CRÍTICO": "🚨", "ALTA": "⚠️", "MEDIA": "🟡"}.get(sev, "ℹ️")
+                title = {
+                    "CRÍTICO": "CRÍTICO — Atención inmediata",
+                    "ALTA": "ALTA — Atención requerida",
+                    "MEDIA": "MEDIA — Preventiva",
+                }.get(sev, f"{sev} — Estado del servicio")
 
-    # Falla (sin respuesta)
+                message = format_msg(
+                    title=f"{icon} {title}",
+                    host_name=host.name,
+                    host_ip=host.ip,
+                    when=t,
+                    sections=[
+                        ("📊 Estado", [
+                            f"• Datos: {fmt_mb(datos_mb)}",
+                            f"• Vigencia: {validos_dias if validos_dias is not None else 'n/a'} días",
+                            f"• Saldo: {saldo if saldo is not None else 'n/a'}",
+                        ])
+                    ],
+                    suggested=[
+                        "Planificar recarga/renovación según umbrales",
+                        "Verificar consumo inusual si datos bajan rápido",
+                    ],
+                    footer="⚙️ Origen: USSD (parseado)",
+                )
+                await send_alert(host.id, f"sev_{sev.lower()}", message)
+
+    # 4) Falla (sin respuesta) — formateado
     if telegram_enabled and status == ActionStatus.FAIL.value and attempt >= max_attempts:
-        message = (
-            "ALERTA MoniTe – Router sin respuesta\n"
-            f"Host: {host.name} ({host.ip})\n"
-            f"Acción: {action_key}\n"
-            f"Intentos: {attempt}\n"
-            f"Error: {error_message}\n"
-            f"Hora: {datetime.utcnow().isoformat()}Z"
+        message = format_msg(
+            title="🚫 ALERTA — Acción falló / sin respuesta",
+            host_name=host.name,
+            host_ip=host.ip,
+            when=datetime.utcnow().isoformat() + "Z",
+            sections=[
+                ("🧩 Acción", [f"• {action_key}", f"• Intentos: {attempt}/{max_attempts}"]),
+                ("❌ Error", [f"• {error_message or 'n/a'}"]),
+            ],
+            suggested=[
+                "Revisar conectividad / VPN / energía",
+                "Verificar credenciales si es acción SSH",
+                "Probar un chequeo manual desde el panel",
+            ],
+            footer="⚙️ Origen: Ejecución de acción",
         )
         await send_alert(host.id, "no_response", message)
 
