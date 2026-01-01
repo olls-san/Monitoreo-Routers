@@ -214,8 +214,4 @@ class AppSetting(Base):
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-class AppSetting(Base):
-    __tablename__ = "app_settings"
-    key = Column(String, primary_key=True, index=True)
-    value = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
