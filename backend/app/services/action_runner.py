@@ -105,7 +105,13 @@ def has_saldo_insuficiente(raw: Any) -> bool:
 
 def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
     """
-    Intenta extraer: datos_mb, validos_dias, saldo desde el texto del USSD.
+    Extrae datos_mb, validos_dias, saldo desde el texto del USSD.
+
+    REGLAS IMPORTANTES:
+    - DATOS: solo se extrae desde el label "Datos:" (ignora "toDus:", "toDus", "todus", etc.)
+    - VALIDOS: soporta "validos 33 dias" y también "validos: 33 dias"
+    - SALDO: intenta "Saldo: X" si existe
+
     Devuelve dict con ok_parse y campos extraídos.
     """
     out: Dict[str, Any] = {"ok_parse": False}
@@ -115,36 +121,54 @@ def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
 
     t = msg.lower()
     t = t.replace("días", "dias").replace("día", "dia")
-    t = t.replace(",", ".")  # por si viene 1,5 GB
+    t = t.replace(",", ".")  # 1,5 -> 1.5
+    t = t.replace("\n", " ")
 
-    # DATOS: "900 MB", "1.5 GB", etc.
-    # Nota: esto captura el primer número+unidad que aparezca; si tu USSD trae
-    # saldo "50.00" sin unidad, no lo confundirá porque exige gb|mb.
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(gb|mb)\b", t)
-    if m:
-        val = float(m.group(1))
-        unit = m.group(2)
-        datos_mb = val * 1024 if unit == "gb" else val
-        out["datos_mb"] = float(datos_mb)
+    # -------------------------
+    # DATOS (SOLO desde "Datos:")
+    # Puede venir "Datos: 11.05 GB" o "Datos: 900 MB"
+    # Si aparece más de una vez, tomamos la ÚLTIMA ocurrencia.
+    # -------------------------
+    datos_matches = re.findall(r"datos\s*:\s*(\d+(?:\.\d+)?)\s*(gb|mb)\b", t)
+    if datos_matches:
+        val_str, unit = datos_matches[-1]  # <-- la última ocurrencia de "Datos:"
+        try:
+            val = float(val_str)
+            datos_mb = val * 1024.0 if unit == "gb" else val
+            out["datos_mb"] = float(datos_mb)
+        except Exception:
+            pass
 
-    # VIGENCIA: "vence en 3 dias", "valido por 3 dias", "vigencia: 3 dias"
-    m = re.search(
-        r"(?:vence\s+en|valido(?:\s+por)?|vigencia(?:\s*[:\-])?)\s*(\d+)\s*dia",
-        t
-    )
+    # -------------------------
+    # VALIDOS / VÁLIDOS
+    # Soporta:
+    # - "validos 33 dias"
+    # - "validos: 33 dias"
+    # - "validos=33 dias" (por si acaso)
+    # -------------------------
+    m = re.search(r"\bvalidos?\b\s*[:=\s]\s*(\d+)\s*dias?\b", t)
     if m:
-        out["validos_dias"] = int(m.group(1))
+        try:
+            out["validos_dias"] = int(m.group(1))
+        except Exception:
+            pass
 
-    # SALDO: "saldo: 50", "saldo 50.5"
-    m = re.search(r"saldo(?:\s*[:\-])?\s*(\d+(?:\.\d+)?)", t)
+    # -------------------------
+    # SALDO (opcional)
+    # -------------------------
+    m = re.search(r"\bsaldo\b\s*[:=\-]?\s*\$?\s*(\d+(?:\.\d+)?)\b", t)
     if m:
-        out["saldo"] = float(m.group(1))
+        try:
+            out["saldo"] = float(m.group(1))
+        except Exception:
+            pass
 
     # ok_parse si logró algo útil
     if any(k in out for k in ("datos_mb", "validos_dias", "saldo")):
         out["ok_parse"] = True
 
     return out
+
 
 
 def fmt_mb(mb: Any) -> str:
