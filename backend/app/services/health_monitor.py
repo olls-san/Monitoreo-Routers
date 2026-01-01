@@ -13,6 +13,8 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
+import json
+from ..config import settings
 
 from sqlalchemy import select, func, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,72 +118,155 @@ async def check_all_hosts(session: AsyncSession) -> List[HostHealth]:
 
 
 async def send_daily_summary(session: AsyncSession) -> None:
-    """Compute and send a daily summary of host statuses and recent events.
-
-    The summary includes:
-        - Total number of hosts.
-        - Number of currently offline hosts (based on cached status).
-        - Count of offline events in the last 24 hours.
-        - Count of action failures in the last 24 hours.
-        - Top 5 hosts with the most offline events in the last 24 hours.
-
-    The summary is sent via Telegram using the send_alert helper. If
-    Telegram is not configured or sending fails, the exception is
-    suppressed and logged.
-    """
     now = datetime.utcnow()
-    since = now - timedelta(hours=24)
 
-    # Total hosts
+    # --------------------
+    # A) Estado actual
+    # --------------------
     total_hosts = (await session.execute(select(func.count()).select_from(Host))).scalar_one()
-    # Offline currently
-    offline_now = (await session.execute(select(func.count()).select_from(Host).where(Host.last_status == "offline"))).scalar_one()
-    # Offline events last 24h
-    offline_events_24h = (
-        await session.execute(
-            select(func.count())
-            .select_from(HostHealth)
-            .where(and_(HostHealth.checked_at >= since, HostHealth.status == "offline"))
-        )
-    ).scalar_one()
-    # Action failures last 24h
-    action_errors_24h = (
-        await session.execute(
-            select(func.count())
-            .select_from(ActionRun)
-            .where(and_(ActionRun.started_at >= since, ActionRun.status == ActionStatus.FAIL.value))
-        )
-    ).scalar_one()
-    # Top 5 hosts by offline events last 24h
-    result = await session.execute(
-        select(Host.name, Host.ip, func.count().label("cnt"))
-        .join(HostHealth, HostHealth.host_id == Host.id)
-        .where(and_(HostHealth.checked_at >= since, HostHealth.status == "offline"))
-        .group_by(Host.id)
-        .order_by(desc("cnt"))
-        .limit(5)
-    )
-    top_offline = result.all()
 
+    offline_rows = await session.execute(
+        select(Host.name)
+        .where(Host.last_status == "offline")
+        .order_by(Host.name.asc())
+        .limit(8)
+    )
+    offline_names = [r[0] for r in offline_rows.all()]
+    offline_now = len(offline_names)
+    online_now = max(total_hosts - offline_now, 0)
+
+    # --------------------
+    # B) Preventivas (desde DB)
+    # Tomamos la última ejecución exitosa de CONSULTAR_SALDO por host.
+    # --------------------
+    saldo_rows = await session.execute(
+        select(ActionRun.host_id, Host.name, Host.ip, ActionRun.response_parsed, ActionRun.started_at)
+        .join(Host, Host.id == ActionRun.host_id)
+        .where(
+            and_(
+                ActionRun.action_key == "VER_LOGS_USSD",
+                ActionRun.status == ActionStatus.SUCCESS.value,
+            )
+        )
+        .order_by(desc(ActionRun.started_at))
+        .limit(2000)
+    )
+
+    latest_by_host = {}
+    for host_id, name, ip, resp, started_at in saldo_rows.all():
+        if host_id in latest_by_host:
+            continue
+
+        # response_parsed puede venir como dict (si SQLAlchemy lo materializa)
+        # o como string (si fue guardado como JSON string)
+        parsed = None
+        if isinstance(resp, dict):
+            parsed = resp
+        elif isinstance(resp, str) and resp.strip():
+            try:
+                parsed = json.loads(resp)
+            except Exception:
+                parsed = None
+
+        if isinstance(parsed, dict):
+            latest_by_host[host_id] = {
+                "name": name,
+                "ip": ip,
+                "started_at": started_at,
+                "parsed": parsed,
+            }
+
+    low_data_mb = int(getattr(settings, "telegram_low_data_mb", 1024) or 1024)
+    exp_days = int(getattr(settings, "telegram_expiring_days", 3) or 3)
+    low_balance = getattr(settings, "telegram_low_balance", None)
+
+    def fmt_mb(mb):
+        try:
+            mb = float(mb)
+        except Exception:
+            return "n/a"
+        if mb >= 1024:
+            return f"{mb/1024:.2f} GB"
+        return f"{mb:.0f} MB"
+
+    low_data_list = []
+    expiring_list = []
+    low_balance_list = []
+
+    for item in latest_by_host.values():
+        p = item["parsed"]
+        if p.get("ok_parse") is not True:
+            continue
+
+        datos_mb = p.get("datos_mb")
+        validos_dias = p.get("validos_dias")
+        saldo = p.get("saldo")
+
+        if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
+            low_data_list.append((item["name"], datos_mb, validos_dias))
+
+        if isinstance(validos_dias, int) and validos_dias <= exp_days:
+            expiring_list.append((item["name"], validos_dias, datos_mb))
+
+        if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
+            low_balance_list.append((item["name"], saldo, datos_mb, validos_dias))
+
+    # Orden por urgencia
+    low_data_list.sort(key=lambda x: x[1])
+    expiring_list.sort(key=lambda x: x[1])
+    low_balance_list.sort(key=lambda x: x[1])
+
+    # --------------------
+    # Mensaje final
+    # --------------------
     lines: List[str] = []
-    lines.append("📊 Resumen diario MoniTe")
+    lines.append("Resumen diario MoniTe")
     lines.append(f"UTC: {now.isoformat()}Z")
     lines.append("")
-    lines.append(f"Hosts totales: {total_hosts}")
-    lines.append(f"Hosts offline ahora: {offline_now}")
-    lines.append(f"Eventos offline (24h): {offline_events_24h}")
-    lines.append(f"Acciones fallidas (24h): {action_errors_24h}")
-    if top_offline:
-        lines.append("")
-        lines.append("Top inestables (24h):")
-        for name, ip, cnt in top_offline:
-            lines.append(f"• {name} ({ip}) — {cnt} caídas")
+    lines.append("A) Estado actual")
+    lines.append(f"- Hosts totales: {total_hosts}")
+    lines.append(f"- Online: {online_now}")
+    lines.append(f"- Offline: {offline_now}")
+    if offline_names:
+        lines.append("- Offline (lista corta):")
+        for n in offline_names:
+            lines.append(f"  • {n}")
+    lines.append("")
+
+    lines.append("B) Preventivas")
+    if low_data_list:
+        lines.append(f"- Datos < {fmt_mb(low_data_mb)}:")
+        for name, mb, dias in low_data_list[:10]:
+            lines.append(f"  • {name}: {fmt_mb(mb)} | válidos: {dias if dias is not None else 'n/a'} días")
+        if len(low_data_list) > 10:
+            lines.append(f"  +{len(low_data_list) - 10} más")
+    else:
+        lines.append(f"- Datos < {fmt_mb(low_data_mb)}: OK")
+
+    if expiring_list:
+        lines.append(f"- Vigencia ≤ {exp_days} días:")
+        for name, dias, mb in expiring_list[:10]:
+            lines.append(f"  • {name}: {dias} días | datos: {fmt_mb(mb)}")
+        if len(expiring_list) > 10:
+            lines.append(f"  +{len(expiring_list) - 10} más")
+    else:
+        lines.append(f"- Vigencia ≤ {exp_days} días: OK")
+
+    if low_balance is None:
+        lines.append("- Saldo bajo: desactivado")
+    else:
+        if low_balance_list:
+            lines.append(f"- Saldo ≤ {low_balance}:")
+            for name, s, mb, dias in low_balance_list[:10]:
+                lines.append(f"  • {name}: {s} | datos: {fmt_mb(mb)} | válidos: {dias if dias is not None else 'n/a'} días")
+            if len(low_balance_list) > 10:
+                lines.append(f"  +{len(low_balance_list) - 10} más")
+        else:
+            lines.append(f"- Saldo ≤ {low_balance}: OK")
 
     message = "\n".join(lines)
 
-    # Use a generic alert key for summaries so cooldown is per host
     try:
-        # We pass host_id=0 to indicate a global alert
         await send_alert(0, "daily_summary", message)
     except Exception as exc:
         logger.error("Failed to send daily summary: %s", exc)

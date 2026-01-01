@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database import init_db, engine
 from .routers import hosts, actions, automation, history, config
 from .services.scheduler import SchedulerService
+from .routers import settings as settings_router
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,7 @@ scheduler_service = SchedulerService()
 
 # Make scheduler available to automation router
 automation.scheduler_service = scheduler_service
+
 
 
 @asynccontextmanager
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
     try:
         await scheduler_service.start()
         logger.info("Scheduler started")
+        app.state.scheduler_service = scheduler_service
     except Exception:
         logger.exception("Scheduler failed to start (continuing without scheduler)")
 
@@ -75,7 +78,7 @@ app.include_router(actions.router)
 app.include_router(automation.router)
 app.include_router(history.router)
 app.include_router(config.router)
-
+app.include_router(settings_router.router)
 
 # Root endpoint
 @app.get("/")

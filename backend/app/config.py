@@ -40,10 +40,13 @@ class Settings(BaseSettings):
     # TCP probe may be implemented.
     health_timeout_seconds: int = Field(default=3, description="Timeout for health check connection attempts")
 
-    # Daily summary schedule. The report will be sent via Telegram
-    # each day at the configured hour and minute (UTC). Values are
-    # integers in 24-hour time. Defaults to 09:00.
+    # Daily summary schedule. (Legacy / fallback)
     telegram_daily_summary_hour: int = Field(default=9, description="Hour (0-23) for daily summary")
     telegram_daily_summary_minute: int = Field(default=0, description="Minute (0-59) for daily summary")
+
+    # Preventivas (USSD / saldo)
+    telegram_low_data_mb: int = Field(default=1024, description="Umbral datos bajos en MB (1024=1GB)")
+    telegram_expiring_days: int = Field(default=3, description="Umbral vigencia baja en días")
+    telegram_low_balance: float | None = Field(default=None, description="Umbral saldo bajo (None desactiva)")
 
 settings = Settings()

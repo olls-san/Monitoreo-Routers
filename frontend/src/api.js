@@ -160,3 +160,15 @@ export async function deleteAutomationRule(id) {
   }
   return null;
 }
+
+export function getTelegramSchedule() {
+  return fetchJSON("/settings/telegram-schedule");
+}
+
+export function updateTelegramSchedule(data) {
+  return fetchJSON("/settings/telegram-schedule", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}

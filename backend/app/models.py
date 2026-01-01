@@ -206,3 +206,10 @@ class HostHealth(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<HostHealth id={self.id} host_id={self.host_id} status={self.status} at={self.checked_at}>"
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key = Column(String, primary_key=True, index=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

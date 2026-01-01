@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import AutomationRules from "./AutomationRules.jsx";
 import HostManager from "./HostManager.jsx";
+import { getTelegramSchedule, updateTelegramSchedule } from "../api.js";
+
 
 const TABS = [
   { key: "system", label: "Sistema" },
@@ -30,6 +32,23 @@ export default function SettingsPage() {
   const hostIdParam = sp.get("hostId");
 
   const [config, setConfig] = useState(null);
+    const [tgSched, setTgSched] = useState(null);
+  const [tgSaving, setTgSaving] = useState(false);
+  const [tgMsg, setTgMsg] = useState(null);
+
+  useEffect(() => {
+    async function loadSchedule() {
+      try {
+        const s = await getTelegramSchedule();
+        setTgSched(s);
+      } catch (e) {
+        // si falla, no rompas toda la UI
+        setTgSched(null);
+      }
+    }
+    loadSchedule();
+  }, []);
+
   const [error, setError] = useState(null);
 
   useEffect(() => {
@@ -86,6 +105,88 @@ export default function SettingsPage() {
                   <div className="text-xs text-gray-500">Scheduler TZ</div>
                   <div className="mt-1 text-gray-200">{config.scheduler_timezone}</div>
                 </div>
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-4">
+            <div className="font-semibold mb-2">Telegram – Resumen diario</div>
+
+            {!tgSched ? (
+              <div className="text-gray-300 text-sm">Cargando configuración...</div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    checked={!!tgSched.enabled}
+                    onChange={(e) => setTgSched({ ...tgSched, enabled: e.target.checked })}
+                  />
+                  <div className="text-sm text-gray-200">Habilitado</div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="rounded-xl border border-gray-800 bg-gray-950 p-3">
+                    <div className="text-xs text-gray-500">Hora</div>
+                    <input
+                      className="mt-2 w-full rounded-lg bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-gray-200"
+                      type="number"
+                      min={0}
+                      max={23}
+                      value={tgSched.hour}
+                      onChange={(e) => setTgSched({ ...tgSched, hour: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div className="rounded-xl border border-gray-800 bg-gray-950 p-3">
+                    <div className="text-xs text-gray-500">Minuto</div>
+                    <input
+                      className="mt-2 w-full rounded-lg bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-gray-200"
+                      type="number"
+                      min={0}
+                      max={59}
+                      value={tgSched.minute}
+                      onChange={(e) => setTgSched({ ...tgSched, minute: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div className="rounded-xl border border-gray-800 bg-gray-950 p-3">
+                    <div className="text-xs text-gray-500">Timezone</div>
+                    <select
+                      className="mt-2 w-full rounded-lg bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-gray-200"
+                      value={tgSched.timezone}
+                      onChange={(e) => setTgSched({ ...tgSched, timezone: e.target.value })}
+                    >
+                      <option value="UTC">UTC</option>
+                      <option value="America/New_York">America/New_York</option>
+                      <option value="America/Havana">America/Havana</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    disabled={tgSaving}
+                    onClick={async () => {
+                      setTgSaving(true);
+                      setTgMsg(null);
+                      try {
+                        const saved = await updateTelegramSchedule(tgSched);
+                        setTgSched(saved);
+                        setTgMsg("Guardado y reprogramado.");
+                      } catch (e) {
+                        setTgMsg("Error guardando la configuración.");
+                      } finally {
+                        setTgSaving(false);
+                      }
+                    }}
+                    className="px-3 py-2 rounded-lg text-sm border border-gray-700 bg-gray-950 text-gray-200 hover:bg-gray-800 disabled:opacity-60"
+                  >
+                    Guardar
+                  </button>
+
+                  {tgMsg && <div className="text-sm text-gray-300">{tgMsg}</div>}
+                </div>
+              </div>
+            )}
+          </div>
+
                 <div className="rounded-xl border border-gray-800 bg-gray-950 p-3">
                   <div className="text-xs text-gray-500">Timeout</div>
                   <div className="mt-1 text-gray-200">{config.request_timeout} s</div>

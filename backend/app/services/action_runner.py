@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional, List
+from ..config import settings
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -205,6 +206,67 @@ async def execute_and_record(
                 f"Hora: {datetime.utcnow()}"
             )
             await send_alert(host.id, "low_balance", message)
+        # ------------------------
+    # Preventivas al consultar saldo (CONSULTAR_SALDO)
+    # ------------------------
+    if telegram_enabled and status == ActionStatus.SUCCESS.value and action_key == "VER_LOGS_USSD":
+        # response_parsed aquí viene del driver (dict) normalmente.
+        parsed = response_parsed if isinstance(response_parsed, dict) else None
+
+        if parsed and parsed.get("ok_parse") is True:
+            datos_mb = parsed.get("datos_mb")
+            validos_dias = parsed.get("validos_dias")
+            saldo = parsed.get("saldo")
+            t = parsed.get("time") or datetime.utcnow().isoformat()
+
+            def fmt_mb(mb: Any) -> str:
+                try:
+                    mb = float(mb)
+                except Exception:
+                    return "n/a"
+                if mb >= 1024:
+                    return f"{mb/1024:.2f} GB"
+                return f"{mb:.0f} MB"
+
+            low_data_mb = int(getattr(settings, "telegram_low_data_mb", 1024) or 1024)
+            exp_days = int(getattr(settings, "telegram_expiring_days", 3) or 3)
+            low_balance = getattr(settings, "telegram_low_balance", None)
+
+            # Datos bajos
+            if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
+                message = (
+                    "Preventiva – Datos bajos\n"
+                    f"Host: {host.name} ({host.ip})\n"
+                    f"Hora: {t}\n"
+                    f"Datos: {fmt_mb(datos_mb)} (umbral < {fmt_mb(low_data_mb)})\n"
+                    f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días\n"
+                    f"Saldo: {saldo if saldo is not None else 'n/a'}"
+                )
+                await send_alert(host.id, "low_data", message)
+
+            # Vigencia baja
+            if isinstance(validos_dias, int) and validos_dias <= exp_days:
+                message = (
+                    "Preventiva – Vigencia baja\n"
+                    f"Host: {host.name} ({host.ip})\n"
+                    f"Hora: {t}\n"
+                    f"Válidos: {validos_dias} días (umbral ≤ {exp_days})\n"
+                    f"Datos: {fmt_mb(datos_mb)}\n"
+                    f"Saldo: {saldo if saldo is not None else 'n/a'}"
+                )
+                await send_alert(host.id, "expiring", message)
+
+            # Saldo bajo (opcional)
+            if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
+                message = (
+                    "Preventiva – Saldo bajo\n"
+                    f"Host: {host.name} ({host.ip})\n"
+                    f"Hora: {t}\n"
+                    f"Saldo: {saldo} (umbral ≤ {low_balance})\n"
+                    f"Datos: {fmt_mb(datos_mb)}\n"
+                    f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días"
+                )
+                await send_alert(host.id, "low_balance_threshold", message)
 
     if telegram_enabled and status == ActionStatus.FAIL.value and attempt >= max_attempts:
         message = (

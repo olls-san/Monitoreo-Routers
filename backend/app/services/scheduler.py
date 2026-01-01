@@ -1,10 +1,7 @@
 """Automation scheduler using APScheduler.
 
 This module sets up an asynchronous scheduler for executing
-automation rules defined in the database. Each rule schedules a
-job that periodically executes an action on a host according to
-its cron or interval specification. Retries and alerts are
-handled within the job function.
+automation rules defined in the database.
 """
 
 from __future__ import annotations
@@ -17,11 +14,12 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
+from ..config import settings
 from ..database import get_async_session
 from ..models import AutomationRule, Host
 from ..services.action_runner import execute_and_record
 from ..services.health_monitor import check_all_hosts, send_daily_summary
-from ..config import settings
+from ..services.app_settings import get_telegram_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +34,19 @@ class SchedulerService:
         """Start the scheduler and load jobs from the database."""
         self.scheduler.start()
         await self.load_jobs()
-        # Schedule periodic health checks for all hosts
+
+        # -------------------------
+        # Health checks job
+        # -------------------------
         try:
             interval_seconds = int(getattr(settings, "health_interval_seconds", 300) or 300)
-            # Define async job wrapper for health checks
+
             async def health_job() -> None:
                 async for session in get_async_session():
-                    # run within a transaction
                     async with session.begin():
                         await check_all_hosts(session)
-                        # commit is handled by session.begin context
                     break
+
             self.scheduler.add_job(
                 health_job,
                 trigger=IntervalTrigger(seconds=interval_seconds),
@@ -57,33 +57,15 @@ class SchedulerService:
                 misfire_grace_time=60,
             )
         except Exception as exc:
-            # Log but do not prevent app startup
-            import logging
-            logging.getLogger(__name__).exception("Failed to schedule health check job: %s", exc)
+            logger.exception("Failed to schedule health check job: %s", exc)
 
-        # Schedule daily summary via Telegram
+        # -------------------------
+        # Daily summary job (DB configurable)
+        # -------------------------
         try:
-            hour = int(getattr(settings, "telegram_daily_summary_hour", 9) or 9)
-            minute = int(getattr(settings, "telegram_daily_summary_minute", 0) or 0)
-            tz = getattr(settings, "scheduler_timezone", "UTC")
-            cron = CronTrigger(hour=hour, minute=minute, timezone=tz)
-            async def summary_job() -> None:
-                async for session in get_async_session():
-                    async with session.begin():
-                        await send_daily_summary(session)
-                    break
-            self.scheduler.add_job(
-                summary_job,
-                trigger=cron,
-                id="daily_summary",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=600,
-            )
+            await self.reschedule_daily_summary()
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).exception("Failed to schedule daily summary job: %s", exc)
+            logger.exception("Failed to schedule daily summary job: %s", exc)
 
     async def stop(self) -> None:
         """Stop the scheduler and remove all jobs."""
@@ -92,10 +74,52 @@ class SchedulerService:
         finally:
             self.scheduler.shutdown()
 
+    async def reschedule_daily_summary(self) -> None:
+        """(Re)Schedule the daily summary job based on DB settings."""
+        # Lee schedule desde DB (o defaults)
+        sched = None
+        async for session in get_async_session():
+            sched = await get_telegram_schedule(session)
+            break
+
+        enabled = bool((sched or {}).get("enabled", True))
+        hour = int((sched or {}).get("hour", 9))
+        minute = int((sched or {}).get("minute", 0))
+        tz = str((sched or {}).get("timezone", getattr(settings, "scheduler_timezone", "UTC")))
+
+        # Remover job si existe
+        try:
+            if self.scheduler.get_job("daily_summary"):
+                self.scheduler.remove_job("daily_summary")
+        except Exception:
+            pass
+
+        if not enabled:
+            logger.info("Daily summary disabled by settings")
+            return
+
+        cron = CronTrigger(hour=hour, minute=minute, timezone=tz)
+
+        async def summary_job() -> None:
+            async for s in get_async_session():
+                async with s.begin():
+                    await send_daily_summary(s)
+                break
+
+        self.scheduler.add_job(
+            summary_job,
+            trigger=cron,
+            id="daily_summary",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=600,
+        )
+
+        logger.info("Daily summary scheduled at %02d:%02d (%s)", hour, minute, tz)
+
     async def load_jobs(self) -> None:
         """Load automation rules from the database and schedule them."""
-        # get_async_session() is an async generator (FastAPI dependency style),
-        # so we consume it with async for ... break
         async for session in get_async_session():
             result = await session.execute(
                 select(AutomationRule.id).where(AutomationRule.enabled == True)
@@ -112,20 +136,17 @@ class SchedulerService:
         """Add a job for a given automation rule."""
         job_id = f"automation-{rule_id}"
 
-        # Remove existing job if present (avoid duplication)
         try:
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
         except Exception:
             pass
 
-        # Load rule to decide scheduling
         async for session in get_async_session():
             rule: AutomationRule | None = await session.get(AutomationRule, rule_id)
             if not rule or not rule.enabled:
                 return
 
-            # Validate host exists (optional, but keeps logs clean)
             host: Host | None = await session.get(Host, rule.host_id)
             if not host:
                 return
@@ -137,7 +158,6 @@ class SchedulerService:
                 logger.error("Invalid cron schedule for rule %s: %r (%s)", rule_id, schedule, e)
                 return
 
-            # Define async job wrapper (must be sync-callable by APScheduler, but can be async)
             async def job_wrapper() -> None:
                 await self._run_rule(rule_id)
 
@@ -171,7 +191,6 @@ class SchedulerService:
                     telegram_enabled=rule.telegram_enabled,
                 )
 
-                # run.status is Enum in our model -> compare using .value
                 status_value = getattr(run.status, "value", run.status)
                 if status_value == "SUCCESS":
                     break
