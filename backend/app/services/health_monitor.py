@@ -12,9 +12,9 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..drivers import get_driver
@@ -41,7 +41,6 @@ def fmt_mb(mb: Any) -> str:
 
 
 def fmt_dt_short(iso_or_dt: Any) -> str:
-    # deja bonito: 2026-01-01 09:15
     try:
         if isinstance(iso_or_dt, datetime):
             dt = iso_or_dt
@@ -59,7 +58,7 @@ def host_line(name: str, ip: str, datos_mb: Any, validos_dias: Any, saldo: Any) 
 
 
 # ------------------------
-# DB helper
+# DB helpers
 # ------------------------
 
 async def get_latest_ussd_parsed_map(session: AsyncSession, host_ids: List[int]) -> dict:
@@ -95,6 +94,42 @@ async def get_latest_ussd_parsed_map(session: AsyncSession, host_ids: List[int])
     return out
 
 
+async def last_n_statuses(session: AsyncSession, host_id: int, n: int = 6) -> List[str]:
+    """
+    Devuelve los últimos N estados (más recientes primero) desde HostHealth.
+    """
+    rows = await session.execute(
+        select(HostHealth.status)
+        .where(HostHealth.host_id == host_id)
+        .order_by(HostHealth.checked_at.desc())
+        .limit(n)
+    )
+    return [r[0] for r in rows.all()]
+
+
+def should_alert_offline_confirmed(last_statuses: List[str], required: int = 5) -> bool:
+    """
+    Regla anti-spam:
+    - Alertar SOLO cuando se cumple por primera vez "required OFFLINE seguidos".
+    - Es decir: los últimos 'required' son offline,
+      y el siguiente (required+1) NO es offline (o no existe).
+    last_statuses debe venir en orden: más reciente primero.
+    """
+    if len(last_statuses) < required:
+        return False
+
+    # últimos required (más recientes)
+    head = last_statuses[:required]
+    if not all(s == "offline" for s in head):
+        return False
+
+    # borde: evitar repetir si ya llevaba offline antes del grupo
+    if len(last_statuses) >= required + 1:
+        return last_statuses[required] != "offline"
+
+    return True
+
+
 # ------------------------
 # Checks
 # ------------------------
@@ -107,6 +142,7 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
     status: str = "offline"
     latency_ms: Optional[float] = None
     error_message: Optional[str] = None
+
     start = time.perf_counter()
     try:
         await driver.validate(host)
@@ -120,6 +156,7 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
 
     now = datetime.utcnow()
 
+    # Persist health row
     health = HostHealth(
         host_id=host.id,
         status=status,
@@ -129,40 +166,59 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
     )
     session.add(health)
 
+    # Update host cache fields
     host.last_status = status
     host.last_checked_at = now
     host.last_latency_ms = latency_ms
 
-    # Send Telegram alert if state changed
-    if host.notify_enabled and previous_status and previous_status != status:
-        try:
-            if status == "offline":
-                msg = (
-                    "🔴 Host OFFLINE\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📍 Host: {host.name}\n"
-                    f"🌐 IP: {host.ip}\n"
-                    f"🕒 Hora: {now.isoformat()}Z\n"
-                    f"Antes: {previous_status} → Ahora: {status}\n"
-                    f"Error: {error_message or 'n/a'}"
-                )
-                await send_alert(host.id, "host_offline", msg)
-            else:
-                lat = f"{latency_ms:.0f} ms" if latency_ms is not None else "n/a"
-                msg = (
-                    "🟢 Host ONLINE\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📍 Host: {host.name}\n"
-                    f"🌐 IP: {host.ip}\n"
-                    f"🕒 Hora: {now.isoformat()}Z\n"
-                    f"Antes: {previous_status} → Ahora: {status}\n"
-                    f"Latencia: {lat}"
-                )
-                await send_alert(host.id, "host_online", msg)
-        except Exception as exc:
-            logger.error("Failed to send state change alert for host %s: %s", host.id, exc)
-
+    # Importante: flush para que el health recién creado se vea en queries del mismo ciclo
     await session.flush()
+
+    # ------------------------
+    # Telegram alerts (anti-spam OFFLINE + formato estructurado)
+    # ------------------------
+    if host.notify_enabled:
+        try:
+            if status == "online":
+                # ONLINE: avisar solo cuando RECUPERA (evita ruido)
+                # (Si quieres avisar siempre que esté online, cambia la condición)
+                if previous_status and previous_status != "online":
+                    lat = f"{latency_ms:.0f} ms" if latency_ms is not None else "n/a"
+                    msg = (
+                        "🟢 ONLINE — Host recuperado\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Host: {host.name}\n"
+                        f"🌐 IP: {host.ip}\n"
+                        f"🕒 Hora: {now.isoformat()}Z\n\n"
+                        f"📶 Latencia: {lat}\n\n"
+                        "Acción sugerida:\n"
+                        "• Confirmar estabilidad en el panel\n"
+                        "• Ejecutar una acción (si aplica)"
+                    )
+                    await send_alert(host.id, "host_online", msg)
+
+            else:
+                # OFFLINE: anti-spam → alertar solo cuando se cumple 5 OFFLINE seguidos (primera vez)
+                last6 = await last_n_statuses(session, host.id, 6)
+                if should_alert_offline_confirmed(last6, required=5):
+                    msg = (
+                        "🔴 OFFLINE — Confirmado (5 chequeos)\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Host: {host.name}\n"
+                        f"🌐 IP: {host.ip}\n"
+                        f"🕒 Hora: {now.isoformat()}Z\n\n"
+                        "Criterio:\n"
+                        "• OFFLINE en 5 chequeos consecutivos\n\n"
+                        "Acción sugerida:\n"
+                        "• Revisar conectividad / VPN / energía\n"
+                        "• Verificar que el router esté encendido\n"
+                        "• Intentar un chequeo manual"
+                    )
+                    await send_alert(host.id, "host_offline_confirmed", msg)
+
+        except Exception as exc:
+            logger.error("Failed to send health alert for host %s: %s", host.id, exc)
+
     return health
 
 
@@ -204,7 +260,7 @@ async def send_daily_summary(session: AsyncSession) -> None:
     # 2) Último VER_LOGS_USSD por host (para severidad)
     # --------------------
     host_rows = await session.execute(select(Host.id, Host.name, Host.ip).order_by(Host.name.asc()))
-    hosts = host_rows.all()  # [(id,name,ip), ...]
+    hosts: List[Tuple[int, str, str]] = host_rows.all()
 
     host_ids = [hid for (hid, _n, _ip) in hosts]
     latest_parsed_by_host = await get_latest_ussd_parsed_map(session, host_ids)
@@ -213,9 +269,7 @@ async def send_daily_summary(session: AsyncSession) -> None:
     high_lines: List[str] = []
     med_lines: List[str] = []
 
-    # También mandaremos 1 alerta por host (solo si entra en severidad)
-    per_host_alerts: List[tuple[int, str, str, str]] = []
-    # tuple: (host_id, sev, name, ip)
+    per_host_alerts: List[Tuple[int, str, str, str]] = []  # (host_id, sev, name, ip)
 
     for host_id, name, ip in hosts:
         parsed = latest_parsed_by_host.get(host_id)
@@ -284,7 +338,7 @@ async def send_daily_summary(session: AsyncSession) -> None:
     await send_alert(0, "daily_summary", header)
 
     # --------------------
-    # 4) Mensaje por host OFFLINE
+    # 4) Mensaje por host OFFLINE (del resumen diario)
     # --------------------
     for host_id, name, ip in offline_hosts:
         msg = (
