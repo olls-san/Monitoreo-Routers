@@ -15,6 +15,11 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 import json
 from ..config import settings
+import json
+from sqlalchemy import and_, desc, func, select
+from ..config import settings
+from ..models import Host, ActionRun, ActionStatus
+from ..services.telegram import send_alert
 
 from sqlalchemy import select, func, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -121,23 +126,21 @@ async def send_daily_summary(session: AsyncSession) -> None:
     now = datetime.utcnow()
 
     # --------------------
-    # A) Estado actual
+    # 1) Estado actual: obtener todos los offline
     # --------------------
     total_hosts = (await session.execute(select(func.count()).select_from(Host))).scalar_one()
 
     offline_rows = await session.execute(
-        select(Host.name)
+        select(Host.id, Host.name, Host.ip)
         .where(Host.last_status == "offline")
         .order_by(Host.name.asc())
-        .limit(8)
     )
-    offline_names = [r[0] for r in offline_rows.all()]
-    offline_now = len(offline_names)
+    offline_hosts = offline_rows.all()
+    offline_now = len(offline_hosts)
     online_now = max(total_hosts - offline_now, 0)
 
     # --------------------
-    # B) Preventivas (desde DB)
-    # Tomamos la última ejecución exitosa de CONSULTAR_SALDO por host.
+    # 2) Preventivas: usar último VER_LOGS_USSD exitoso por host (desde DB)
     # --------------------
     saldo_rows = await session.execute(
         select(ActionRun.host_id, Host.name, Host.ip, ActionRun.response_parsed, ActionRun.started_at)
@@ -149,7 +152,7 @@ async def send_daily_summary(session: AsyncSession) -> None:
             )
         )
         .order_by(desc(ActionRun.started_at))
-        .limit(2000)
+        .limit(4000)  # suficiente para muchos hosts, se filtra por "último por host"
     )
 
     latest_by_host = {}
@@ -157,8 +160,6 @@ async def send_daily_summary(session: AsyncSession) -> None:
         if host_id in latest_by_host:
             continue
 
-        # response_parsed puede venir como dict (si SQLAlchemy lo materializa)
-        # o como string (si fue guardado como JSON string)
         parsed = None
         if isinstance(resp, dict):
             parsed = resp
@@ -189,84 +190,105 @@ async def send_daily_summary(session: AsyncSession) -> None:
             return f"{mb/1024:.2f} GB"
         return f"{mb:.0f} MB"
 
-    low_data_list = []
-    expiring_list = []
-    low_balance_list = []
+    # --------------------
+    # 3) (Opcional) Encabezado general (1 solo mensaje)
+    # --------------------
+    # Conteo de preventivas
+    low_data_count = 0
+    expiring_count = 0
+    low_balance_count = 0
 
     for item in latest_by_host.values():
         p = item["parsed"]
         if p.get("ok_parse") is not True:
             continue
-
         datos_mb = p.get("datos_mb")
         validos_dias = p.get("validos_dias")
         saldo = p.get("saldo")
 
         if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
-            low_data_list.append((item["name"], datos_mb, validos_dias))
-
+            low_data_count += 1
         if isinstance(validos_dias, int) and validos_dias <= exp_days:
-            expiring_list.append((item["name"], validos_dias, datos_mb))
-
+            expiring_count += 1
         if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
-            low_balance_list.append((item["name"], saldo, datos_mb, validos_dias))
+            low_balance_count += 1
 
-    # Orden por urgencia
-    low_data_list.sort(key=lambda x: x[1])
-    expiring_list.sort(key=lambda x: x[1])
-    low_balance_list.sort(key=lambda x: x[1])
+    header = (
+        "Resumen diario MoniTe\n"
+        f"UTC: {now.isoformat()}Z\n\n"
+        "Estado actual\n"
+        f"- Hosts totales: {total_hosts}\n"
+        f"- Online: {online_now}\n"
+        f"- Offline: {offline_now}\n\n"
+        "Preventivas (conteo)\n"
+        f"- Datos < {fmt_mb(low_data_mb)}: {low_data_count}\n"
+        f"- Vigencia ≤ {exp_days} días: {expiring_count}\n"
+        + (f"- Saldo ≤ {low_balance}: {low_balance_count}\n" if low_balance is not None else "- Saldo bajo: desactivado\n")
+    )
+
+    # host_id=0 para "global". alert_key fijo para que no se duplique demasiado
+    await send_alert(0, "daily_summary_header", header)
 
     # --------------------
-    # Mensaje final
+    # 4) Mensaje por host OFFLINE
     # --------------------
-    lines: List[str] = []
-    lines.append("Resumen diario MoniTe")
-    lines.append(f"UTC: {now.isoformat()}Z")
-    lines.append("")
-    lines.append("A) Estado actual")
-    lines.append(f"- Hosts totales: {total_hosts}")
-    lines.append(f"- Online: {online_now}")
-    lines.append(f"- Offline: {offline_now}")
-    if offline_names:
-        lines.append("- Offline (lista corta):")
-        for n in offline_names:
-            lines.append(f"  • {n}")
-    lines.append("")
+    for host_id, name, ip in offline_hosts:
+        msg = (
+            "OFFLINE\n"
+            f"Host: {name} ({ip})\n"
+            f"UTC: {now.isoformat()}Z\n"
+            "Acción sugerida: revisar conectividad / VPN / energía."
+        )
+        await send_alert(host_id, "daily_offline", msg)
 
-    lines.append("B) Preventivas")
-    if low_data_list:
-        lines.append(f"- Datos < {fmt_mb(low_data_mb)}:")
-        for name, mb, dias in low_data_list[:10]:
-            lines.append(f"  • {name}: {fmt_mb(mb)} | válidos: {dias if dias is not None else 'n/a'} días")
-        if len(low_data_list) > 10:
-            lines.append(f"  +{len(low_data_list) - 10} más")
-    else:
-        lines.append(f"- Datos < {fmt_mb(low_data_mb)}: OK")
+    # --------------------
+    # 5) Mensaje por host que cumpla preventivas
+    # --------------------
+    for host_id, item in latest_by_host.items():
+        p = item["parsed"]
+        if p.get("ok_parse") is not True:
+            continue
 
-    if expiring_list:
-        lines.append(f"- Vigencia ≤ {exp_days} días:")
-        for name, dias, mb in expiring_list[:10]:
-            lines.append(f"  • {name}: {dias} días | datos: {fmt_mb(mb)}")
-        if len(expiring_list) > 10:
-            lines.append(f"  +{len(expiring_list) - 10} más")
-    else:
-        lines.append(f"- Vigencia ≤ {exp_days} días: OK")
+        name = item["name"]
+        ip = item["ip"]
+        t = p.get("time") or (item["started_at"].isoformat() if item["started_at"] else now.isoformat())
 
-    if low_balance is None:
-        lines.append("- Saldo bajo: desactivado")
-    else:
-        if low_balance_list:
-            lines.append(f"- Saldo ≤ {low_balance}:")
-            for name, s, mb, dias in low_balance_list[:10]:
-                lines.append(f"  • {name}: {s} | datos: {fmt_mb(mb)} | válidos: {dias if dias is not None else 'n/a'} días")
-            if len(low_balance_list) > 10:
-                lines.append(f"  +{len(low_balance_list) - 10} más")
-        else:
-            lines.append(f"- Saldo ≤ {low_balance}: OK")
+        datos_mb = p.get("datos_mb")
+        validos_dias = p.get("validos_dias")
+        saldo = p.get("saldo")
 
-    message = "\n".join(lines)
+        # Datos bajos
+        if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
+            msg = (
+                "Preventiva – Datos bajos\n"
+                f"Host: {name} ({ip})\n"
+                f"Lectura: {t}\n"
+                f"Datos: {fmt_mb(datos_mb)} (umbral < {fmt_mb(low_data_mb)})\n"
+                f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días\n"
+                f"Saldo: {saldo if saldo is not None else 'n/a'}"
+            )
+            await send_alert(host_id, "daily_low_data", msg)
 
-    try:
-        await send_alert(0, "daily_summary", message)
-    except Exception as exc:
-        logger.error("Failed to send daily summary: %s", exc)
+        # Vigencia baja
+        if isinstance(validos_dias, int) and validos_dias <= exp_days:
+            msg = (
+                "Preventiva – Vigencia baja\n"
+                f"Host: {name} ({ip})\n"
+                f"Lectura: {t}\n"
+                f"Válidos: {validos_dias} días (umbral ≤ {exp_days})\n"
+                f"Datos: {fmt_mb(datos_mb)}\n"
+                f"Saldo: {saldo if saldo is not None else 'n/a'}"
+            )
+            await send_alert(host_id, "daily_expiring", msg)
+
+        # Saldo bajo (opcional)
+        if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
+            msg = (
+                "Preventiva – Saldo bajo\n"
+                f"Host: {name} ({ip})\n"
+                f"Lectura: {t}\n"
+                f"Saldo: {saldo} (umbral ≤ {low_balance})\n"
+                f"Datos: {fmt_mb(datos_mb)}\n"
+                f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días"
+            )
+            await send_alert(host_id, "daily_low_balance", msg)
