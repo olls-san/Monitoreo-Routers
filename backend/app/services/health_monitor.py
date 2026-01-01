@@ -8,45 +8,99 @@ summary of host statuses and recent alerts.
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 import time
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
-import json
-from ..config import settings
-import json
-from sqlalchemy import and_, desc, func, select
-from ..config import settings
-from ..models import Host, ActionRun, ActionStatus
-from ..services.telegram import send_alert
+from datetime import datetime
+from typing import Any, List, Optional
 
-from sqlalchemy import select, func, desc, and_
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..database import get_async_session
-from ..models import Host, HostHealth, ActionRun, ActionStatus
 from ..drivers import get_driver
+from ..models import Host, HostHealth, ActionRun, ActionStatus
 from ..services.telegram import send_alert
+from ..services.app_settings import get_telegram_severity
+from ..services.severity import evaluate_severity
 
 logger = logging.getLogger(__name__)
 
 
-async def check_host(session: AsyncSession, host: Host) -> HostHealth:
-    """Check the connectivity of a single host and persist the result.
+# ------------------------
+# Helpers (formato)
+# ------------------------
 
-    The host's `validate()` method on its driver is used to determine
-    connectivity. If the driver validation raises an exception, the host
-    is considered offline. Latency in milliseconds is measured for
-    successful checks. The host's cached status fields are updated.
+def fmt_mb(mb: Any) -> str:
+    try:
+        mb = float(mb)
+    except Exception:
+        return "n/a"
+    if mb >= 1024:
+        return f"{mb/1024:.2f} GB"
+    return f"{mb:.0f} MB"
 
-    Args:
-        session: SQLAlchemy async session.
-        host: Host entity to check.
 
-    Returns:
-        The persisted HostHealth instance.
+def fmt_dt_short(iso_or_dt: Any) -> str:
+    # deja bonito: 2026-01-01 09:15
+    try:
+        if isinstance(iso_or_dt, datetime):
+            dt = iso_or_dt
+        else:
+            dt = datetime.fromisoformat(str(iso_or_dt).replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(iso_or_dt)
+
+
+def host_line(name: str, ip: str, datos_mb: Any, validos_dias: Any, saldo: Any) -> str:
+    vd = validos_dias if validos_dias is not None else "n/a"
+    sa = saldo if saldo is not None else "n/a"
+    return f"• {name} ({ip}) — Datos: {fmt_mb(datos_mb)} | Vigencia: {vd}d | Saldo: {sa}"
+
+
+# ------------------------
+# DB helper
+# ------------------------
+
+async def get_latest_ussd_parsed_map(session: AsyncSession, host_ids: List[int]) -> dict:
     """
+    Devuelve {host_id: parsed_dict} con el último VER_LOGS_USSD SUCCESS por host.
+    parsed_dict viene de ActionRun.response_parsed (json text).
+    """
+    if not host_ids:
+        return {}
+
+    stmt = (
+        select(ActionRun.host_id, ActionRun.response_parsed, ActionRun.started_at)
+        .where(ActionRun.host_id.in_(host_ids))
+        .where(ActionRun.action_key == "VER_LOGS_USSD")
+        .where(ActionRun.status == ActionStatus.SUCCESS.value)
+        .order_by(ActionRun.host_id, desc(ActionRun.started_at))
+    )
+
+    rows = (await session.execute(stmt)).all()
+
+    out = {}
+    for host_id, resp_txt, _started_at in rows:
+        if host_id in out:
+            continue
+        if not resp_txt:
+            continue
+        try:
+            d = json.loads(resp_txt) if isinstance(resp_txt, str) else resp_txt
+            if isinstance(d, dict):
+                out[host_id] = d
+        except Exception:
+            continue
+    return out
+
+
+# ------------------------
+# Checks
+# ------------------------
+
+async def check_host(session: AsyncSession, host: Host) -> HostHealth:
+    """Check the connectivity of a single host and persist the result."""
     driver = get_driver(host.router_type)
 
     previous_status: Optional[str] = host.last_status
@@ -55,7 +109,6 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
     error_message: Optional[str] = None
     start = time.perf_counter()
     try:
-        # Use driver.validate() as a lightweight health check
         await driver.validate(host)
         elapsed = (time.perf_counter() - start) * 1000.0
         latency_ms = elapsed
@@ -67,7 +120,6 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
 
     now = datetime.utcnow()
 
-    # Persist health history row
     health = HostHealth(
         host_id=host.id,
         status=status,
@@ -77,7 +129,6 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
     )
     session.add(health)
 
-    # Update host cache fields
     host.last_status = status
     host.last_checked_at = now
     host.last_latency_ms = latency_ms
@@ -87,27 +138,30 @@ async def check_host(session: AsyncSession, host: Host) -> HostHealth:
         try:
             if status == "offline":
                 msg = (
-                    f"🔴 Host offline\n"
-                    f"Host: {host.name} ({host.ip})\n"
-                    f"Antes: {previous_status} -> Ahora: {status}\n"
-                    f"Hora: {now.isoformat()}Z\n"
+                    "🔴 Host OFFLINE\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 Host: {host.name}\n"
+                    f"🌐 IP: {host.ip}\n"
+                    f"🕒 Hora: {now.isoformat()}Z\n"
+                    f"Antes: {previous_status} → Ahora: {status}\n"
                     f"Error: {error_message or 'n/a'}"
                 )
                 await send_alert(host.id, "host_offline", msg)
             else:
                 lat = f"{latency_ms:.0f} ms" if latency_ms is not None else "n/a"
                 msg = (
-                    f"🟢 Host online\n"
-                    f"Host: {host.name} ({host.ip})\n"
-                    f"Antes: {previous_status} -> Ahora: {status}\n"
-                    f"Hora: {now.isoformat()}Z\n"
+                    "🟢 Host ONLINE\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 Host: {host.name}\n"
+                    f"🌐 IP: {host.ip}\n"
+                    f"🕒 Hora: {now.isoformat()}Z\n"
+                    f"Antes: {previous_status} → Ahora: {status}\n"
                     f"Latencia: {lat}"
                 )
                 await send_alert(host.id, "host_online", msg)
         except Exception as exc:
             logger.error("Failed to send state change alert for host %s: %s", host.id, exc)
 
-    # Flush changes but let caller decide commit/rollback
     await session.flush()
     return health
 
@@ -122,11 +176,18 @@ async def check_all_hosts(session: AsyncSession) -> List[HostHealth]:
     return checks
 
 
+# ------------------------
+# Daily summary
+# ------------------------
+
 async def send_daily_summary(session: AsyncSession) -> None:
     now = datetime.utcnow()
 
+    # Umbrales desde el FRONT (DB)
+    thresholds = await get_telegram_severity(session)
+
     # --------------------
-    # 1) Estado actual: obtener todos los offline
+    # 1) Estado actual
     # --------------------
     total_hosts = (await session.execute(select(func.count()).select_from(Host))).scalar_one()
 
@@ -140,155 +201,132 @@ async def send_daily_summary(session: AsyncSession) -> None:
     online_now = max(total_hosts - offline_now, 0)
 
     # --------------------
-    # 2) Preventivas: usar último VER_LOGS_USSD exitoso por host (desde DB)
+    # 2) Último VER_LOGS_USSD por host (para severidad)
     # --------------------
-    saldo_rows = await session.execute(
-        select(ActionRun.host_id, Host.name, Host.ip, ActionRun.response_parsed, ActionRun.started_at)
-        .join(Host, Host.id == ActionRun.host_id)
-        .where(
-            and_(
-                ActionRun.action_key == "VER_LOGS_USSD",
-                ActionRun.status == ActionStatus.SUCCESS.value,
-            )
-        )
-        .order_by(desc(ActionRun.started_at))
-        .limit(4000)  # suficiente para muchos hosts, se filtra por "último por host"
-    )
+    host_rows = await session.execute(select(Host.id, Host.name, Host.ip).order_by(Host.name.asc()))
+    hosts = host_rows.all()  # [(id,name,ip), ...]
 
-    latest_by_host = {}
-    for host_id, name, ip, resp, started_at in saldo_rows.all():
-        if host_id in latest_by_host:
+    host_ids = [hid for (hid, _n, _ip) in hosts]
+    latest_parsed_by_host = await get_latest_ussd_parsed_map(session, host_ids)
+
+    crit_lines: List[str] = []
+    high_lines: List[str] = []
+    med_lines: List[str] = []
+
+    # También mandaremos 1 alerta por host (solo si entra en severidad)
+    per_host_alerts: List[tuple[int, str, str, str]] = []
+    # tuple: (host_id, sev, name, ip)
+
+    for host_id, name, ip in hosts:
+        parsed = latest_parsed_by_host.get(host_id)
+        if not isinstance(parsed, dict) or parsed.get("ok_parse") is not True:
             continue
 
-        parsed = None
-        if isinstance(resp, dict):
-            parsed = resp
-        elif isinstance(resp, str) and resp.strip():
-            try:
-                parsed = json.loads(resp)
-            except Exception:
-                parsed = None
+        datos_mb = parsed.get("datos_mb")
+        validos_dias = parsed.get("validos_dias")
+        saldo = parsed.get("saldo")
 
-        if isinstance(parsed, dict):
-            latest_by_host[host_id] = {
-                "name": name,
-                "ip": ip,
-                "started_at": started_at,
-                "parsed": parsed,
-            }
-
-    low_data_mb = int(getattr(settings, "telegram_low_data_mb", 1024) or 1024)
-    exp_days = int(getattr(settings, "telegram_expiring_days", 3) or 3)
-    low_balance = getattr(settings, "telegram_low_balance", None)
-
-    def fmt_mb(mb):
-        try:
-            mb = float(mb)
-        except Exception:
-            return "n/a"
-        if mb >= 1024:
-            return f"{mb/1024:.2f} GB"
-        return f"{mb:.0f} MB"
-
-    # --------------------
-    # 3) (Opcional) Encabezado general (1 solo mensaje)
-    # --------------------
-    # Conteo de preventivas
-    low_data_count = 0
-    expiring_count = 0
-    low_balance_count = 0
-
-    for item in latest_by_host.values():
-        p = item["parsed"]
-        if p.get("ok_parse") is not True:
+        sev = evaluate_severity(datos_mb, validos_dias, thresholds)
+        if not sev:
             continue
-        datos_mb = p.get("datos_mb")
-        validos_dias = p.get("validos_dias")
-        saldo = p.get("saldo")
 
-        if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
-            low_data_count += 1
-        if isinstance(validos_dias, int) and validos_dias <= exp_days:
-            expiring_count += 1
-        if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
-            low_balance_count += 1
+        line = host_line(name, ip, datos_mb, validos_dias, saldo)
 
-    header = (
-        "Resumen diario MoniTe\n"
-        f"UTC: {now.isoformat()}Z\n\n"
-        "Estado actual\n"
-        f"- Hosts totales: {total_hosts}\n"
-        f"- Online: {online_now}\n"
-        f"- Offline: {offline_now}\n\n"
-        "Preventivas (conteo)\n"
-        f"- Datos < {fmt_mb(low_data_mb)}: {low_data_count}\n"
-        f"- Vigencia ≤ {exp_days} días: {expiring_count}\n"
-        + (f"- Saldo ≤ {low_balance}: {low_balance_count}\n" if low_balance is not None else "- Saldo bajo: desactivado\n")
-    )
+        if sev == "CRÍTICO":
+            crit_lines.append(line)
+        elif sev == "ALTA":
+            high_lines.append(line)
+        elif sev == "MEDIA":
+            med_lines.append(line)
 
-    # host_id=0 para "global". alert_key fijo para que no se duplique demasiado
-    await send_alert(0, "daily_summary_header", header)
+        per_host_alerts.append((host_id, sev, name, ip))
+
+    # --------------------
+    # 3) Mensaje global (1 solo)
+    # --------------------
+    lines: List[str] = []
+    lines.append("📌 MoniTe — Resumen diario")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🕒 {fmt_dt_short(now)} (UTC)")
+    lines.append("")
+
+    lines.append("A) Estado actual")
+    lines.append(f"• Hosts totales: {total_hosts}")
+    lines.append(f"• Online: {online_now}")
+    lines.append(f"• Offline: {offline_now}")
+
+    if offline_hosts:
+        lines.append("• Offline (lista):")
+        for _hid, n, ip in offline_hosts:
+            lines.append(f"  • {n} ({ip})")
+    else:
+        lines.append("• Offline (lista): ✅ OK")
+
+    lines.append("")
+    lines.append("B) Preventivas (por severidad)")
+
+    def block(title: str, arr: List[str]) -> None:
+        if not arr:
+            lines.append(f"{title}: ✅ OK")
+        else:
+            lines.append(f"{title}:")
+            lines.extend(arr)
+
+    block("🚨 CRÍTICOS", crit_lines)
+    block("⚠️ ALTAS", high_lines)
+    block("🟡 MEDIAS", med_lines)
+
+    lines.append("")
+    lines.append("—")
+    lines.append("⚙️ Fuente: último USSD por host")
+
+    header = "\n".join(lines)
+    await send_alert(0, "daily_summary", header)
 
     # --------------------
     # 4) Mensaje por host OFFLINE
     # --------------------
     for host_id, name, ip in offline_hosts:
         msg = (
-            "OFFLINE\n"
-            f"Host: {name} ({ip})\n"
-            f"UTC: {now.isoformat()}Z\n"
-            "Acción sugerida: revisar conectividad / VPN / energía."
+            "🔴 OFFLINE — Host sin respuesta\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Host: {name}\n"
+            f"🌐 IP: {ip}\n"
+            f"🕒 UTC: {now.isoformat()}Z\n\n"
+            "Acción sugerida:\n"
+            "• Revisar conectividad / VPN / energía\n"
+            "• Intentar validar desde el panel"
         )
         await send_alert(host_id, "daily_offline", msg)
 
     # --------------------
-    # 5) Mensaje por host que cumpla preventivas
+    # 5) Un mensaje por host con severidad (CRÍTICO/ALTA/MEDIA)
     # --------------------
-    for host_id, item in latest_by_host.items():
-        p = item["parsed"]
-        if p.get("ok_parse") is not True:
-            continue
+    for host_id, sev, name, ip in per_host_alerts:
+        parsed = latest_parsed_by_host.get(host_id) or {}
+        t = parsed.get("time") or now.isoformat()
+        datos_mb = parsed.get("datos_mb")
+        validos_dias = parsed.get("validos_dias")
+        saldo = parsed.get("saldo")
 
-        name = item["name"]
-        ip = item["ip"]
-        t = p.get("time") or (item["started_at"].isoformat() if item["started_at"] else now.isoformat())
+        icon = {"CRÍTICO": "🚨", "ALTA": "⚠️", "MEDIA": "🟡"}.get(sev, "ℹ️")
+        title = {
+            "CRÍTICO": "CRÍTICO — Atención inmediata",
+            "ALTA": "ALTA — Atención requerida",
+            "MEDIA": "MEDIA — Preventiva",
+        }.get(sev, f"{sev} — Estado")
 
-        datos_mb = p.get("datos_mb")
-        validos_dias = p.get("validos_dias")
-        saldo = p.get("saldo")
+        msg = (
+            f"{icon} {title}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Host: {name}\n"
+            f"🌐 IP: {ip}\n"
+            f"🕒 Lectura: {t}\n\n"
+            "📊 Estado\n"
+            f"• Datos: {fmt_mb(datos_mb)}\n"
+            f"• Vigencia: {validos_dias if validos_dias is not None else 'n/a'} días\n"
+            f"• Saldo: {saldo if saldo is not None else 'n/a'}\n\n"
+            "⚙️ Origen: USSD"
+        )
 
-        # Datos bajos
-        if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
-            msg = (
-                "Preventiva – Datos bajos\n"
-                f"Host: {name} ({ip})\n"
-                f"Lectura: {t}\n"
-                f"Datos: {fmt_mb(datos_mb)} (umbral < {fmt_mb(low_data_mb)})\n"
-                f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días\n"
-                f"Saldo: {saldo if saldo is not None else 'n/a'}"
-            )
-            await send_alert(host_id, "daily_low_data", msg)
-
-        # Vigencia baja
-        if isinstance(validos_dias, int) and validos_dias <= exp_days:
-            msg = (
-                "Preventiva – Vigencia baja\n"
-                f"Host: {name} ({ip})\n"
-                f"Lectura: {t}\n"
-                f"Válidos: {validos_dias} días (umbral ≤ {exp_days})\n"
-                f"Datos: {fmt_mb(datos_mb)}\n"
-                f"Saldo: {saldo if saldo is not None else 'n/a'}"
-            )
-            await send_alert(host_id, "daily_expiring", msg)
-
-        # Saldo bajo (opcional)
-        if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
-            msg = (
-                "Preventiva – Saldo bajo\n"
-                f"Host: {name} ({ip})\n"
-                f"Lectura: {t}\n"
-                f"Saldo: {saldo} (umbral ≤ {low_balance})\n"
-                f"Datos: {fmt_mb(datos_mb)}\n"
-                f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días"
-            )
-            await send_alert(host_id, "daily_low_balance", msg)
+        await send_alert(host_id, f"daily_sev_{sev.lower()}", msg)
