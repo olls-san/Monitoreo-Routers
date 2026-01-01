@@ -172,3 +172,14 @@ export function updateTelegramSchedule(data) {
     body: JSON.stringify(data),
   });
 }
+export function getTelegramSeverity() {
+  return fetchJSON("/settings/telegram-severity");
+}
+
+export function updateTelegramSeverity(data) {
+  return fetchJSON("/settings/telegram-severity", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}

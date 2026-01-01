@@ -76,7 +76,7 @@ class MikroTikRouterOSRestDriver(RouterDriver):
             if action_key == self.ACTION_CONSULTAR_SALDO:
                 payload = {
                     "port": "lte1",
-                    "phone-number": "*222#",
+                    "phone-number": "*222*328#",
                     "message": "",
                     "type": "ussd",
                 }

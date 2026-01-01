@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, Optional, List
-from ..config import settings
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..models import ActionRun, ActionStatus, Host
 from ..drivers import get_driver
 from ..services.telegram import send_alert
+from ..services.app_settings import get_telegram_severity
+from ..services.severity import evaluate_severity
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,58 @@ def has_saldo_insuficiente(raw: Any) -> bool:
     return False
 
 
+def parse_ussd_fields_from_message(msg: str) -> Dict[str, Any]:
+    """
+    Intenta extraer: datos_mb, validos_dias, saldo desde el texto del USSD.
+    Devuelve dict con ok_parse y campos extraídos.
+    """
+    out: Dict[str, Any] = {"ok_parse": False}
+
+    if not msg:
+        return out
+
+    t = msg.lower()
+    t = t.replace("días", "dias").replace("día", "dia")
+    t = t.replace(",", ".")  # por si viene 1,5 GB
+
+    # DATOS: "900 MB", "1.5 GB", etc.
+    # Nota: esto captura el primer número+unidad que aparezca; si tu USSD trae
+    # saldo "50.00" sin unidad, no lo confundirá porque exige gb|mb.
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(gb|mb)\b", t)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        datos_mb = val * 1024 if unit == "gb" else val
+        out["datos_mb"] = float(datos_mb)
+
+    # VIGENCIA: "vence en 3 dias", "valido por 3 dias", "vigencia: 3 dias"
+    m = re.search(
+        r"(?:vence\s+en|valido(?:\s+por)?|vigencia(?:\s*[:\-])?)\s*(\d+)\s*dia",
+        t
+    )
+    if m:
+        out["validos_dias"] = int(m.group(1))
+
+    # SALDO: "saldo: 50", "saldo 50.5"
+    m = re.search(r"saldo(?:\s*[:\-])?\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        out["saldo"] = float(m.group(1))
+
+    # ok_parse si logró algo útil
+    if any(k in out for k in ("datos_mb", "validos_dias", "saldo")):
+        out["ok_parse"] = True
+
+    return out
+
+
+def fmt_mb(mb: Any) -> str:
+    try:
+        mb = float(mb)
+    except Exception:
+        return "n/a"
+    return f"{mb/1024:.2f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+
 # ------------------------
 # Main logic
 # ------------------------
@@ -136,8 +191,15 @@ async def execute_and_record(
             # Guardamos raw en memoria solo para alertas
             ussd_raw_for_alerts = response_raw
 
-            # Guardamos en parsed solo lo útil para UI
-            response_parsed = {"ussd_latest": extract_latest_ussd(response_raw)}
+            latest = extract_latest_ussd(response_raw)
+            response_parsed = {"ussd_latest": latest}
+
+            # Parsear campos desde el texto del último USSD (si existe)
+            if latest and latest.get("message"):
+                msg_txt = str(latest.get("message"))
+                fields = parse_ussd_fields_from_message(msg_txt)
+                response_parsed.update(fields)
+                response_parsed["time"] = latest.get("time") or datetime.utcnow().isoformat()
 
             # No guardamos stdout ni response_raw gigantes
             stdout = None
@@ -185,97 +247,63 @@ async def execute_and_record(
         if isinstance(response_parsed, dict):
             latest = response_parsed.get("ussd_latest")
 
-        # ✅ Mandar SIEMPRE el último USSD (Saldo/Tarifa/etc.)
+        # 1) Enviar SIEMPRE el último USSD (si hay)
         if latest and latest.get("message"):
             msg = str(latest.get("message"))
-            t = latest.get("time") or datetime.utcnow().isoformat()
+            t = (
+                (response_parsed.get("time") if isinstance(response_parsed, dict) else None)
+                or latest.get("time")
+                or datetime.utcnow().isoformat()
+            )
 
             message = (
-                f"MoniTe – USSD (último)\n"
+                "MoniTe – USSD (último)\n"
                 f"Host: {host.name} ({host.ip})\n"
                 f"Hora: {t}\n"
                 f"{msg}"
             )
             await send_alert(host.id, "ussd_latest", message)
 
-        # ✅ Mantener alerta especial si hubo "saldo insuficiente" en cualquier parte
+        # 2) Mantener alerta especial si hubo "saldo insuficiente"
         if ussd_raw_for_alerts is not None and has_saldo_insuficiente(ussd_raw_for_alerts):
             message = (
-                f"ALERTA MoniTe – Saldo insuficiente\n"
+                "ALERTA MoniTe – Saldo insuficiente\n"
                 f"Host: {host.name} ({host.ip})\n"
-                f"Hora: {datetime.utcnow()}"
+                f"Hora: {datetime.utcnow().isoformat()}Z"
             )
             await send_alert(host.id, "low_balance", message)
-        # ------------------------
-    # Preventivas al consultar saldo (CONSULTAR_SALDO)
-    # ------------------------
-    if telegram_enabled and status == ActionStatus.SUCCESS.value and action_key == "VER_LOGS_USSD":
-        # response_parsed aquí viene del driver (dict) normalmente.
-        parsed = response_parsed if isinstance(response_parsed, dict) else None
 
+        # 3) Severidad configurable desde el front
+        parsed = response_parsed if isinstance(response_parsed, dict) else None
         if parsed and parsed.get("ok_parse") is True:
             datos_mb = parsed.get("datos_mb")
             validos_dias = parsed.get("validos_dias")
             saldo = parsed.get("saldo")
             t = parsed.get("time") or datetime.utcnow().isoformat()
 
-            def fmt_mb(mb: Any) -> str:
-                try:
-                    mb = float(mb)
-                except Exception:
-                    return "n/a"
-                if mb >= 1024:
-                    return f"{mb/1024:.2f} GB"
-                return f"{mb:.0f} MB"
+            thresholds = await get_telegram_severity(session)
+            sev = evaluate_severity(datos_mb, validos_dias, thresholds)
 
-            low_data_mb = int(getattr(settings, "telegram_low_data_mb", 1024) or 1024)
-            exp_days = int(getattr(settings, "telegram_expiring_days", 3) or 3)
-            low_balance = getattr(settings, "telegram_low_balance", None)
-
-            # Datos bajos
-            if isinstance(datos_mb, (int, float)) and datos_mb < low_data_mb:
-                message = (
-                    "Preventiva – Datos bajos\n"
+            if sev:
+                msg = (
+                    f"{sev} – Estado del servicio\n"
                     f"Host: {host.name} ({host.ip})\n"
-                    f"Hora: {t}\n"
-                    f"Datos: {fmt_mb(datos_mb)} (umbral < {fmt_mb(low_data_mb)})\n"
+                    f"Lectura: {t}\n"
+                    f"Datos: {fmt_mb(datos_mb)}\n"
                     f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días\n"
                     f"Saldo: {saldo if saldo is not None else 'n/a'}"
                 )
-                await send_alert(host.id, "low_data", message)
+                await send_alert(host.id, f"sev_{sev.lower()}", msg)
 
-            # Vigencia baja
-            if isinstance(validos_dias, int) and validos_dias <= exp_days:
-                message = (
-                    "Preventiva – Vigencia baja\n"
-                    f"Host: {host.name} ({host.ip})\n"
-                    f"Hora: {t}\n"
-                    f"Válidos: {validos_dias} días (umbral ≤ {exp_days})\n"
-                    f"Datos: {fmt_mb(datos_mb)}\n"
-                    f"Saldo: {saldo if saldo is not None else 'n/a'}"
-                )
-                await send_alert(host.id, "expiring", message)
-
-            # Saldo bajo (opcional)
-            if low_balance is not None and isinstance(saldo, (int, float)) and saldo <= float(low_balance):
-                message = (
-                    "Preventiva – Saldo bajo\n"
-                    f"Host: {host.name} ({host.ip})\n"
-                    f"Hora: {t}\n"
-                    f"Saldo: {saldo} (umbral ≤ {low_balance})\n"
-                    f"Datos: {fmt_mb(datos_mb)}\n"
-                    f"Válidos: {validos_dias if validos_dias is not None else 'n/a'} días"
-                )
-                await send_alert(host.id, "low_balance_threshold", message)
-
+    # Falla (sin respuesta)
     if telegram_enabled and status == ActionStatus.FAIL.value and attempt >= max_attempts:
         message = (
-            f"ALERTA MoniTe – Router sin respuesta\n"
+            "ALERTA MoniTe – Router sin respuesta\n"
             f"Host: {host.name} ({host.ip})\n"
             f"Acción: {action_key}\n"
             f"Intentos: {attempt}\n"
             f"Error: {error_message}\n"
-            f"Hora: {datetime.utcnow()}"
+            f"Hora: {datetime.utcnow().isoformat()}Z"
         )
         await send_alert(host.id, "no_response", message)
 

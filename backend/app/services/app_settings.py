@@ -16,6 +16,15 @@ DEFAULT_SCHEDULE = {
     "timezone": "UTC",
 }
 
+TELEGRAM_SEVERITY_KEY = "telegram_severity_thresholds"
+
+DEFAULT_SEVERITY = {
+    "critical": {"days": 1, "data_mb": 300},
+    "high": {"days": 3, "data_mb": 1024},
+    "medium": {"days": 7, "data_mb": 2048},
+}
+
+
 async def get_setting_json(session: AsyncSession, key: str, default: Any = None) -> Any:
     row = await session.get(AppSetting, key)
     if not row or not row.value:
@@ -42,4 +51,16 @@ async def get_telegram_schedule(session: AsyncSession) -> dict:
     # Merge con defaults para evitar faltantes
     merged = DEFAULT_SCHEDULE.copy()
     merged.update(data)
+    return merged
+
+async def get_telegram_severity(session: AsyncSession) -> dict:
+    data = await get_setting_json(session, TELEGRAM_SEVERITY_KEY, None)
+    if not isinstance(data, dict):
+        return DEFAULT_SEVERITY.copy()
+
+    merged = DEFAULT_SEVERITY.copy()
+    # merge profundo básico
+    for k in ["critical", "high", "medium"]:
+        if isinstance(data.get(k), dict):
+            merged[k] = {**merged[k], **data[k]}
     return merged

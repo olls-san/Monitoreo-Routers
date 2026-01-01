@@ -1,0 +1,12 @@
+2026-01-01 07:55:19 | INFO | USSD | Aplicación iniciada.
+2026-01-01 07:55:46 | INFO | USSD | Solicitud de logs USSD hacia 10.128.36.1
+2026-01-01 07:56:16 | INFO | USSD | OK: {'descripcion': 'Obteniendo logs USSD', 'returncode': 0, 'ms': 29921.2} 
+2026-01-01 07:56:16 | INFO | USSD | Resultado 'LOGS USSD' mostrado en UI.
+2026-01-01 07:58:23 | INFO | USSD | Solicitud de logs USSD hacia 10.10.21.1
+2026-01-01 07:58:30 | INFO | USSD | OK: {'descripcion': 'Obteniendo logs USSD', 'returncode': 0, 'ms': 6979.87} 
+2026-01-01 07:58:30 | INFO | USSD | Resultado 'LOGS USSD' mostrado en UI.
+2026-01-01 08:02:00 | INFO | USSD | Consulta de saldo básica (*222#) hacia 10.10.21.1
+2026-01-01 08:02:03 | INFO | USSD | OK: {'descripcion': 'Consulta saldo básica', 'returncode': 0, 'ms': 2303.69} 
+2026-01-01 08:02:13 | INFO | USSD | Consulta de saldo detallada (*222*328#) hacia 10.10.21.1
+2026-01-01 08:02:36 | INFO | USSD | OK: {'descripcion': 'Consulta saldo detallada', 'returncode': 0, 'ms': 23066.77} 
+2026-01-01 08:02:36 | INFO | USSD | Resultado 'CONSULTA DE SALDO' mostrado en UI.
